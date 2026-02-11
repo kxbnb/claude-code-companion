@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("companion_tui=debug")),
+                .unwrap_or_else(|_| EnvFilter::new("claude_code_companion=debug")),
         )
         .with_writer(file_appender)
         .with_ansi(false)
@@ -85,7 +85,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── WebSocket server ─────────────────────────────────────────────────
-    let ws_server = server::ws_server::WsServer::new(args.port, event_tx.clone());
+    let ws_server = server::ws_server::WsServer::bind(args.port, event_tx.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to bind WebSocket port {}: {} (is another companion running?)", args.port, e))?;
     tokio::spawn(async move {
         if let Err(e) = ws_server.run().await {
             tracing::error!("WebSocket server error: {}", e);

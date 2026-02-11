@@ -47,6 +47,14 @@ pub fn parse_command(input: &str) -> Command {
             index: arg.and_then(|s| s.parse::<usize>().ok()),
         },
         "clear" => Command::Clear,
+        "go" => Command::Go {
+            partial_name: arg.unwrap_or_default(),
+        },
+        "export" => Command::Export {
+            path: arg.unwrap_or_default(),
+        },
+        "pin" => Command::Pin,
+        "unpin" => Command::Unpin,
         "help" | "h" | "?" => Command::Help,
         "q" | "quit" | "exit" => Command::Quit,
         other => Command::Unknown(other.to_string()),
@@ -525,6 +533,94 @@ pub fn execute_command(cmd: Command, app: &mut App) -> CommandResult {
             app.dirty = true;
             CommandResult::Ok
         }
+        Command::Go { partial_name } => {
+            if partial_name.is_empty() {
+                app.flash("Usage: :go <name>".to_string());
+            } else {
+                let query = partial_name.to_lowercase();
+                let visible = app.visible_session_order();
+                let found = visible.iter().find(|id| {
+                    app.sessions
+                        .get(id.as_str())
+                        .map(|s| s.name.to_lowercase().contains(&query))
+                        .unwrap_or(false)
+                });
+                if let Some(id) = found {
+                    let id = id.clone();
+                    app.switch_to_session(&id);
+                    app.flash(format!("Switched to session"));
+                } else {
+                    app.flash(format!("No session matching '{}'", partial_name));
+                }
+            }
+            app.dirty = true;
+            CommandResult::Ok
+        }
+        Command::Export { path } => {
+            if path.is_empty() {
+                app.flash("Usage: :export <path>".to_string());
+            } else {
+                let expanded = if path.starts_with('~') {
+                    dirs::home_dir()
+                        .map(|h| path.replacen('~', &h.to_string_lossy(), 1))
+                        .unwrap_or(path.clone())
+                } else {
+                    path.clone()
+                };
+                if let Some(session) = app.active_session() {
+                    let mut md = String::new();
+                    for msg in &session.messages {
+                        match msg.role {
+                            crate::app::ChatRole::User => {
+                                md.push_str("## You\n\n");
+                                md.push_str(&msg.content);
+                                md.push_str("\n\n");
+                            }
+                            crate::app::ChatRole::Assistant => {
+                                md.push_str("## Claude\n\n");
+                                md.push_str(&msg.content);
+                                md.push_str("\n\n");
+                            }
+                            crate::app::ChatRole::System => {
+                                md.push_str("> ");
+                                md.push_str(&msg.content.replace('\n', "\n> "));
+                                md.push_str("\n\n");
+                            }
+                        }
+                    }
+                    match std::fs::write(&expanded, &md) {
+                        Ok(()) => {
+                            app.flash(format!("Exported to {}", expanded));
+                        }
+                        Err(e) => {
+                            app.flash(format!("Export failed: {}", e));
+                        }
+                    }
+                }
+            }
+            app.dirty = true;
+            CommandResult::Ok
+        }
+        Command::Pin => {
+            if let Some(session) = app.active_session_mut() {
+                session.pinned = true;
+                session.dirty_persist = true;
+                let _ = session.persist();
+                app.flash("Session pinned".to_string());
+            }
+            app.dirty = true;
+            CommandResult::Ok
+        }
+        Command::Unpin => {
+            if let Some(session) = app.active_session_mut() {
+                session.pinned = false;
+                session.dirty_persist = true;
+                let _ = session.persist();
+                app.flash("Session unpinned".to_string());
+            }
+            app.dirty = true;
+            CommandResult::Ok
+        }
         Command::Help => {
             let help = [
                 "Commands:",
@@ -544,19 +640,32 @@ pub fn execute_command(cmd: Command, app: &mut App) -> CommandResult {
                 "  :mode <mode>     Change permission mode",
                 "  :env             List environment profiles",
                 "  :clear           Clear chat history",
+                "  :go <name>       Switch to session by name (fuzzy)",
+                "  :export <path>   Export conversation as markdown",
+                "  :pin             Pin current session to top",
+                "  :unpin           Unpin current session",
                 "  :q               Quit",
                 "",
                 "Keys (Normal mode):",
                 "  i/a      Insert mode     :        Command mode",
-                "  j/k      Scroll          G/gg     Bottom/top",
+                "  j/k      Scroll down/up  G/gg     Bottom/top",
+                "  Ctrl+D/U Half-page dn/up PageUp/Dn  Scroll by 10",
                 "  1-9      Switch session  ]/[      Next/prev session",
-                "  p        Toggle plan     Ctrl+N   New session",
+                "  /        Search chat     n/N      Next/prev match",
+                "  y        Yank response   z        Collapse tools",
+                "  p        Toggle plan     T        Toggle thinking",
                 "  t        Toggle tasks    Tab      Toggle sidebar",
-                "  Ctrl+C   Interrupt/quit",
+                "  Ctrl+N   New session     Ctrl+C   Interrupt/quit",
                 "",
                 "Keys (Insert mode):",
                 "  Enter    Send message    Esc      Normal mode",
-                "  Ctrl+C   Interrupt       Ctrl+Q   Quit",
+                "  Ctrl+J   Insert newline  Up/Down  History / line nav",
+                "  Ctrl+A/E Home/End        Ctrl+K/U Kill to end/start",
+                "  Ctrl+W   Delete word     Ctrl+C   Interrupt",
+                "",
+                "Keys (Command mode):",
+                "  Enter    Execute         Esc      Cancel",
+                "  Up/Down  Command history",
             ];
             if let Some(session) = app.active_session_mut() {
                 session.add_system_message(help.join("\n"));

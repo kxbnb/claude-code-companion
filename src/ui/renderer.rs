@@ -12,7 +12,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::{App, ChatRole, Mode, Session, SessionStatus, TaskStatus};
 use crate::protocol::types::{self, ContentBlock};
 
-// ─── Styled Line ────────────────────────────────────────────────────────────
+// ─── Span-Based ChatLine ─────────────────────────────────────────────────────
 
 #[derive(Clone)]
 enum LineStyle {
@@ -27,9 +27,61 @@ enum LineStyle {
     Dim,
 }
 
-struct StyledLine {
+#[derive(Clone)]
+struct Span {
     text: String,
-    style: LineStyle,
+    fg: Option<Color>,
+    bg: Option<Color>,
+    bold: bool,
+    dim: bool,
+}
+
+impl Span {
+    fn plain(text: String) -> Self {
+        Self { text, fg: None, bg: None, bold: false, dim: false }
+    }
+}
+
+#[derive(Clone)]
+struct ChatLine {
+    spans: Vec<Span>,
+    base_style: LineStyle,
+}
+
+impl ChatLine {
+    fn simple(text: String, style: LineStyle) -> Self {
+        Self {
+            spans: vec![Span::plain(text)],
+            base_style: style,
+        }
+    }
+
+    fn text(&self) -> String {
+        self.spans.iter().map(|s| s.text.as_str()).collect()
+    }
+}
+
+fn truncate_spans(spans: &[Span], max_width: usize) -> Vec<Span> {
+    let mut result = Vec::new();
+    let mut remaining = max_width;
+    for span in spans {
+        if remaining == 0 {
+            break;
+        }
+        let span_width = UnicodeWidthStr::width(span.text.as_str());
+        if span_width <= remaining {
+            result.push(span.clone());
+            remaining -= span_width;
+        } else {
+            let truncated = truncate_to_width(&span.text, remaining);
+            remaining = 0;
+            result.push(Span {
+                text: truncated,
+                ..span.clone()
+            });
+        }
+    }
+    result
 }
 
 // ─── Main Render ────────────────────────────────────────────────────────────
@@ -71,8 +123,11 @@ pub fn render(app: &App, stdout: &mut impl Write) -> anyhow::Result<()> {
         0
     };
 
-    // Layout: chat area + task panel + 1 input + 1 status
-    let chat_height = height.saturating_sub(2 + task_h);
+    // Multi-line input height
+    let input_h = app.composer.line_count().clamp(1, 5);
+
+    // Layout: chat area + task panel + input_h + 1 status
+    let chat_height = height.saturating_sub(1 + input_h + task_h);
 
     queue!(stdout, cursor::Hide, cursor::MoveTo(0, 0))?;
 
@@ -86,10 +141,10 @@ pub fn render(app: &App, stdout: &mut impl Write) -> anyhow::Result<()> {
     let chat_lines = if let Some(session) = session {
         build_chat_lines(session, content_w, app.show_thinking)
     } else {
-        vec![StyledLine {
-            text: "No active session. Press Ctrl+N to create one.".to_string(),
-            style: LineStyle::Dim,
-        }]
+        vec![ChatLine::simple(
+            "No active session. Press Ctrl+N to create one.".to_string(),
+            LineStyle::Dim,
+        )]
     };
 
     // Permission banner takes space from chat area bottom
@@ -116,6 +171,7 @@ pub fn render(app: &App, stdout: &mut impl Write) -> anyhow::Result<()> {
         content_w,
         content_x,
         scroll_offset,
+        &app.search,
     )?;
 
     // Permission banner (rendered at bottom of chat area)
@@ -140,9 +196,9 @@ pub fn render(app: &App, stdout: &mut impl Write) -> anyhow::Result<()> {
         render_task_panel(stdout, &active_tasks, task_row, task_h, content_w, content_x)?;
     }
 
-    // Input line
+    // Input line(s) — multi-line support
     let input_row = (chat_height + task_h) as u16;
-    let input_scroll_start = render_input(stdout, app, input_row, content_w, content_x)?;
+    let input_scroll_start = render_input(stdout, app, input_row, content_w, content_x, input_h)?;
 
     // Slash command menu (above input line)
     if app.slash_menu.visible {
@@ -171,9 +227,16 @@ pub fn render(app: &App, stdout: &mut impl Write) -> anyhow::Result<()> {
     match app.mode {
         Mode::Insert => {
             let prompt_len = 2; // "> "
-            let cursor_x = (content_x + prompt_len + app.composer.cursor_col().saturating_sub(input_scroll_start))
-                .min(width.saturating_sub(1)) as u16;
-            queue!(stdout, cursor::MoveTo(cursor_x, input_row), cursor::Show)?;
+            let (cursor_line, cursor_col) = app.composer.cursor_line_col();
+            let cursor_y = input_row + cursor_line.min(input_h - 1) as u16;
+            let cursor_x = if cursor_line == 0 {
+                (content_x + prompt_len + cursor_col.saturating_sub(input_scroll_start))
+                    .min(width.saturating_sub(1)) as u16
+            } else {
+                (content_x + prompt_len + cursor_col)
+                    .min(width.saturating_sub(1)) as u16
+            };
+            queue!(stdout, cursor::MoveTo(cursor_x, cursor_y), cursor::Show)?;
         }
         Mode::Command => {
             // Cursor in command line (on status bar)
@@ -232,12 +295,14 @@ fn render_sidebar(
                 }
             };
 
+            let pin_marker = if session.pinned { "*" } else { "" };
             let line1 = format!(
-                "{}{} {}. {}",
+                "{}{} {}. {}{}",
                 marker,
                 status_icon,
                 i + 1,
-                truncate_to_width(&session.name, sidebar_w.saturating_sub(7))
+                pin_marker,
+                truncate_to_width(&session.name, sidebar_w.saturating_sub(7 + pin_marker.len()))
             );
 
             // Git info second line
@@ -338,32 +403,25 @@ fn render_sidebar(
 
 // ─── Chat Lines ─────────────────────────────────────────────────────────────
 
-fn build_chat_lines(session: &Session, width: usize, show_thinking: bool) -> Vec<StyledLine> {
+fn build_chat_lines(session: &Session, width: usize, show_thinking: bool) -> Vec<ChatLine> {
     let mut lines = Vec::new();
+    let mut in_code_block = false;
 
     for msg in &session.messages {
         match msg.role {
             ChatRole::User => {
                 let text = format!("You: {}", msg.content);
                 for line in wrap_text(&text, width) {
-                    lines.push(StyledLine {
-                        text: line,
-                        style: LineStyle::User,
-                    });
+                    lines.push(ChatLine::simple(line, LineStyle::User));
                 }
-                lines.push(StyledLine {
-                    text: String::new(),
-                    style: LineStyle::Normal,
-                });
+                lines.push(ChatLine::simple(String::new(), LineStyle::Normal));
             }
             ChatRole::Assistant => {
                 if let Some(blocks) = &msg.content_blocks {
-                    // Group consecutive tool_use blocks by name
                     let mut i = 0;
                     while i < blocks.len() {
                         match &blocks[i] {
                             ContentBlock::ToolUse { name, input, .. } => {
-                                // Count consecutive tool uses with same name
                                 let mut count = 1;
                                 let first_summary = types::format_tool_summary(name, input);
                                 while i + count < blocks.len() {
@@ -383,28 +441,32 @@ fn build_chat_lines(session: &Session, width: usize, show_thinking: bool) -> Vec
                                     format!("[{}] {}", name, first_summary)
                                 };
                                 for line in wrap_text(&text, width) {
-                                    lines.push(StyledLine {
-                                        text: line,
-                                        style: LineStyle::Tool,
-                                    });
+                                    lines.push(ChatLine::simple(line, LineStyle::Tool));
                                 }
                                 i += count;
                             }
                             ContentBlock::ToolResult {
                                 content, is_error, ..
                             } => {
-                                let text = types::extract_tool_result_text(content);
-                                if !text.is_empty() {
-                                    let truncated = truncate_chars(&text, 500);
-                                    for line in wrap_text(&truncated, width) {
-                                        lines.push(StyledLine {
-                                            text: line,
-                                            style: if *is_error {
-                                                LineStyle::Error
-                                            } else {
-                                                LineStyle::ToolResult
-                                            },
-                                        });
+                                if session.tool_results_collapsed {
+                                    lines.push(ChatLine::simple(
+                                        "[result hidden]".to_string(),
+                                        LineStyle::Dim,
+                                    ));
+                                } else {
+                                    let text = types::extract_tool_result_text(content);
+                                    if !text.is_empty() {
+                                        let truncated = truncate_chars(&text, 500);
+                                        for line in wrap_text(&truncated, width) {
+                                            lines.push(ChatLine::simple(
+                                                line,
+                                                if *is_error {
+                                                    LineStyle::Error
+                                                } else {
+                                                    LineStyle::ToolResult
+                                                },
+                                            ));
+                                        }
                                     }
                                 }
                                 i += 1;
@@ -414,10 +476,7 @@ fn build_chat_lines(session: &Session, width: usize, show_thinking: bool) -> Vec
                                     let truncated = truncate_chars(thinking, 200);
                                     let text = format!("(thinking) {}", truncated);
                                     for line in wrap_text(&text, width) {
-                                        lines.push(StyledLine {
-                                            text: line,
-                                            style: LineStyle::Dim,
-                                        });
+                                        lines.push(ChatLine::simple(line, LineStyle::Dim));
                                     }
                                 }
                                 i += 1;
@@ -430,52 +489,49 @@ fn build_chat_lines(session: &Session, width: usize, show_thinking: bool) -> Vec
                 }
 
                 if !msg.content.is_empty() {
-                    let text = format!("Claude: {}", msg.content);
-                    for line in wrap_text(&text, width) {
-                        lines.push(StyledLine {
-                            text: line,
-                            style: LineStyle::Assistant,
-                        });
+                    // Apply markdown rendering to assistant text
+                    let prefixed = format!("Claude: {}", msg.content);
+                    for raw_line in prefixed.split('\n') {
+                        for wrapped in wrap_text(raw_line, width) {
+                            let spans = parse_markdown_line(&wrapped, &mut in_code_block);
+                            lines.push(ChatLine {
+                                spans,
+                                base_style: LineStyle::Assistant,
+                            });
+                        }
                     }
                 }
-                lines.push(StyledLine {
-                    text: String::new(),
-                    style: LineStyle::Normal,
-                });
+                lines.push(ChatLine::simple(String::new(), LineStyle::Normal));
             }
             ChatRole::System => {
                 for line in wrap_text(&msg.content, width) {
-                    lines.push(StyledLine {
-                        text: line,
-                        style: LineStyle::System,
-                    });
+                    lines.push(ChatLine::simple(line, LineStyle::System));
                 }
-                lines.push(StyledLine {
-                    text: String::new(),
-                    style: LineStyle::Normal,
-                });
+                lines.push(ChatLine::simple(String::new(), LineStyle::Normal));
             }
         }
     }
 
-    // Streaming text
+    // Streaming text — also apply markdown
     if !session.streaming_text.is_empty() {
-        let text = format!("Claude: {}", session.streaming_text);
-        for line in wrap_text(&text, width) {
-            lines.push(StyledLine {
-                text: line,
-                style: LineStyle::Streaming,
-            });
+        let prefixed = format!("Claude: {}", session.streaming_text);
+        for raw_line in prefixed.split('\n') {
+            for wrapped in wrap_text(raw_line, width) {
+                let spans = parse_markdown_line(&wrapped, &mut in_code_block);
+                lines.push(ChatLine {
+                    spans,
+                    base_style: LineStyle::Streaming,
+                });
+            }
         }
-        // Show streaming stats
         if let Some(start) = session.stream_start {
             let elapsed = start.elapsed().as_secs_f64();
             let toks = session.stream_output_tokens;
             let tps = if elapsed > 0.0 { toks as f64 / elapsed } else { 0.0 };
-            lines.push(StyledLine {
-                text: format!("{:.1}s \u{2502} ~{} tokens \u{2502} {:.0} tok/s", elapsed, toks, tps),
-                style: LineStyle::Dim,
-            });
+            lines.push(ChatLine::simple(
+                format!("{:.1}s \u{2502} ~{} tokens \u{2502} {:.0} tok/s", elapsed, toks, tps),
+                LineStyle::Dim,
+            ));
         }
     }
 
@@ -483,10 +539,10 @@ fn build_chat_lines(session: &Session, width: usize, show_thinking: bool) -> Vec
     match session.status {
         SessionStatus::WaitingForCli => {
             if lines.is_empty() {
-                lines.push(StyledLine {
-                    text: "Waiting for Claude CLI to connect...".to_string(),
-                    style: LineStyle::Dim,
-                });
+                lines.push(ChatLine::simple(
+                    "Waiting for Claude CLI to connect...".to_string(),
+                    LineStyle::Dim,
+                ));
             }
         }
         SessionStatus::Running
@@ -497,16 +553,16 @@ fn build_chat_lines(session: &Session, width: usize, show_thinking: bool) -> Vec
                     .map(|m| matches!(m.role, ChatRole::User))
                     .unwrap_or(false) =>
         {
-            lines.push(StyledLine {
-                text: "Claude is thinking...".to_string(),
-                style: LineStyle::Dim,
-            });
+            lines.push(ChatLine::simple(
+                "Claude is thinking...".to_string(),
+                LineStyle::Dim,
+            ));
         }
         SessionStatus::Compacting => {
-            lines.push(StyledLine {
-                text: "Compacting context...".to_string(),
-                style: LineStyle::System,
-            });
+            lines.push(ChatLine::simple(
+                "Compacting context...".to_string(),
+                LineStyle::System,
+            ));
         }
         _ => {}
     }
@@ -514,64 +570,260 @@ fn build_chat_lines(session: &Session, width: usize, show_thinking: bool) -> Vec
     lines
 }
 
+// ─── Markdown Parser ────────────────────────────────────────────────────────
+
+fn parse_markdown_line(line: &str, in_code_block: &mut bool) -> Vec<Span> {
+    // Code fence toggle
+    if line.trim_start().starts_with("```") {
+        *in_code_block = !*in_code_block;
+        return vec![Span {
+            text: line.to_string(),
+            fg: Some(Color::DarkYellow),
+            bg: Some(Color::Rgb { r: 30, g: 30, b: 30 }),
+            bold: false,
+            dim: false,
+        }];
+    }
+
+    // Inside code block
+    if *in_code_block {
+        return vec![Span {
+            text: line.to_string(),
+            fg: Some(Color::DarkYellow),
+            bg: Some(Color::Rgb { r: 30, g: 30, b: 30 }),
+            bold: false,
+            dim: false,
+        }];
+    }
+
+    // Header
+    if line.starts_with("# ") || line.starts_with("## ") || line.starts_with("### ") {
+        return vec![Span {
+            text: line.to_string(),
+            fg: Some(Color::Cyan),
+            bg: None,
+            bold: true,
+            dim: false,
+        }];
+    }
+
+    // Bullet list
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+        let indent = line.len() - trimmed.len();
+        let indent_str: String = line[..indent].to_string();
+        let bullet = &trimmed[..2];
+        let rest = &trimmed[2..];
+        let mut spans = Vec::new();
+        if !indent_str.is_empty() {
+            spans.push(Span::plain(indent_str));
+        }
+        spans.push(Span {
+            text: bullet.to_string(),
+            fg: Some(Color::Cyan),
+            bg: None,
+            bold: false,
+            dim: false,
+        });
+        spans.extend(parse_inline_markdown(rest));
+        return spans;
+    }
+
+    // Regular line — parse inline markdown
+    parse_inline_markdown(line)
+}
+
+fn parse_inline_markdown(text: &str) -> Vec<Span> {
+    let mut spans = Vec::new();
+    let mut buf = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        // Bold: **text**
+        if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*' {
+            if !buf.is_empty() {
+                spans.push(Span::plain(std::mem::take(&mut buf)));
+            }
+            i += 2;
+            let mut bold_text = String::new();
+            while i + 1 < len && !(chars[i] == '*' && chars[i + 1] == '*') {
+                bold_text.push(chars[i]);
+                i += 1;
+            }
+            if i + 1 < len {
+                i += 2; // skip closing **
+            }
+            spans.push(Span {
+                text: bold_text,
+                fg: None,
+                bg: None,
+                bold: true,
+                dim: false,
+            });
+            continue;
+        }
+
+        // Inline code: `text`
+        if chars[i] == '`' {
+            if !buf.is_empty() {
+                spans.push(Span::plain(std::mem::take(&mut buf)));
+            }
+            i += 1;
+            let mut code_text = String::new();
+            while i < len && chars[i] != '`' {
+                code_text.push(chars[i]);
+                i += 1;
+            }
+            if i < len {
+                i += 1; // skip closing `
+            }
+            spans.push(Span {
+                text: code_text,
+                fg: Some(Color::Yellow),
+                bg: Some(Color::Rgb { r: 40, g: 40, b: 40 }),
+                bold: false,
+                dim: false,
+            });
+            continue;
+        }
+
+        buf.push(chars[i]);
+        i += 1;
+    }
+
+    if !buf.is_empty() {
+        spans.push(Span::plain(buf));
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::plain(String::new()));
+    }
+
+    spans
+}
+
 fn render_chat_area(
     stdout: &mut impl Write,
-    lines: &[StyledLine],
+    lines: &[ChatLine],
     chat_height: usize,
     width: usize,
     x_offset: usize,
     scroll_offset: usize,
+    search: &Option<crate::app::SearchState>,
 ) -> anyhow::Result<()> {
     let total = lines.len();
-    // Clamp scroll_offset so we don't go past the top
     let clamped_offset = scroll_offset.min(total.saturating_sub(1));
     let end = total.saturating_sub(clamped_offset);
     let start = end.saturating_sub(chat_height);
     let visible = &lines[start..end];
 
+    // Determine search match lines for highlighting
+    let search_match_lines: Vec<usize> = search
+        .as_ref()
+        .map(|s| s.matches.clone())
+        .unwrap_or_default();
+    let current_match_line = search
+        .as_ref()
+        .and_then(|s| s.matches.get(s.current_match).copied());
+
     for (i, line) in visible.iter().enumerate() {
         let row = i as u16;
+        let abs_line = start + i;
         queue!(stdout, cursor::MoveTo(x_offset as u16, row))?;
 
-        match line.style {
-            LineStyle::User => {
-                queue!(
-                    stdout,
-                    SetForegroundColor(Color::Green),
-                    SetAttribute(Attribute::Bold)
-                )?;
-            }
-            LineStyle::Assistant => {
-                queue!(stdout, SetForegroundColor(Color::White))?;
-            }
-            LineStyle::System => {
-                queue!(stdout, SetForegroundColor(Color::Yellow))?;
-            }
-            LineStyle::Tool => {
-                queue!(stdout, SetForegroundColor(Color::Cyan))?;
-            }
-            LineStyle::ToolResult => {
-                queue!(stdout, SetForegroundColor(Color::DarkGrey))?;
-            }
-            LineStyle::Streaming => {
-                queue!(stdout, SetForegroundColor(Color::White))?;
-            }
-            LineStyle::Error => {
-                queue!(stdout, SetForegroundColor(Color::Red))?;
-            }
-            LineStyle::Dim => {
-                queue!(stdout, SetForegroundColor(Color::DarkGrey))?;
-            }
-            LineStyle::Normal => {}
+        // Check if this line is a search match
+        let is_match = search_match_lines.contains(&abs_line);
+        let is_current_match = current_match_line == Some(abs_line);
+
+        if is_current_match {
+            queue!(stdout, SetBackgroundColor(Color::Yellow), SetForegroundColor(Color::Black))?;
+        } else if is_match {
+            queue!(stdout, SetBackgroundColor(Color::DarkYellow), SetForegroundColor(Color::Black))?;
         }
 
-        let display = truncate_to_width(&line.text, width);
-        queue!(
-            stdout,
-            Print(format!("{:width$}", display, width = width)),
-            ResetColor,
-            SetAttribute(Attribute::Reset),
-        )?;
+        // Render spans
+        if line.spans.len() == 1 && line.spans[0].fg.is_none() && line.spans[0].bg.is_none() && !line.spans[0].bold && !line.spans[0].dim {
+            // Simple single-span line — use base_style (backward compat)
+            if !is_match && !is_current_match {
+                match line.base_style {
+                    LineStyle::User => {
+                        queue!(stdout, SetForegroundColor(Color::Green), SetAttribute(Attribute::Bold))?;
+                    }
+                    LineStyle::Assistant => {
+                        queue!(stdout, SetForegroundColor(Color::White))?;
+                    }
+                    LineStyle::System => {
+                        queue!(stdout, SetForegroundColor(Color::Yellow))?;
+                    }
+                    LineStyle::Tool => {
+                        queue!(stdout, SetForegroundColor(Color::Cyan))?;
+                    }
+                    LineStyle::ToolResult => {
+                        queue!(stdout, SetForegroundColor(Color::DarkGrey))?;
+                    }
+                    LineStyle::Streaming => {
+                        queue!(stdout, SetForegroundColor(Color::White))?;
+                    }
+                    LineStyle::Error => {
+                        queue!(stdout, SetForegroundColor(Color::Red))?;
+                    }
+                    LineStyle::Dim => {
+                        queue!(stdout, SetForegroundColor(Color::DarkGrey))?;
+                    }
+                    LineStyle::Normal => {}
+                }
+            }
+            let display = truncate_to_width(&line.text(), width);
+            queue!(
+                stdout,
+                Print(format!("{:width$}", display, width = width)),
+                ResetColor,
+                SetAttribute(Attribute::Reset),
+            )?;
+        } else {
+            // Multi-span line — render each span
+            let truncated = truncate_spans(&line.spans, width);
+            let mut printed_width = 0usize;
+            for span in &truncated {
+                if !is_match && !is_current_match {
+                    if let Some(fg) = span.fg {
+                        queue!(stdout, SetForegroundColor(fg))?;
+                    }
+                    if let Some(bg) = span.bg {
+                        queue!(stdout, SetBackgroundColor(bg))?;
+                    }
+                }
+                if span.bold {
+                    queue!(stdout, SetAttribute(Attribute::Bold))?;
+                }
+                if span.dim {
+                    queue!(stdout, SetAttribute(Attribute::Dim))?;
+                }
+                queue!(stdout, Print(&span.text))?;
+                printed_width += UnicodeWidthStr::width(span.text.as_str());
+                if span.bold || span.dim {
+                    queue!(stdout, SetAttribute(Attribute::Reset))?;
+                    // Re-apply search bg if needed
+                    if is_current_match {
+                        queue!(stdout, SetBackgroundColor(Color::Yellow), SetForegroundColor(Color::Black))?;
+                    } else if is_match {
+                        queue!(stdout, SetBackgroundColor(Color::DarkYellow), SetForegroundColor(Color::Black))?;
+                    }
+                }
+                if !is_match && !is_current_match {
+                    if span.fg.is_some() || span.bg.is_some() {
+                        queue!(stdout, ResetColor)?;
+                    }
+                }
+            }
+            // Pad remaining width
+            if printed_width < width {
+                queue!(stdout, Print(format!("{:w$}", "", w = width - printed_width)))?;
+            }
+            queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
+        }
     }
 
     // Clear remaining chat area lines
@@ -832,9 +1084,8 @@ fn render_input(
     row: u16,
     width: usize,
     x_offset: usize,
+    input_h: usize,
 ) -> anyhow::Result<usize> {
-    queue!(stdout, cursor::MoveTo(x_offset as u16, row))?;
-
     let prompt = if app.mode == Mode::Insert {
         "> "
     } else {
@@ -847,30 +1098,66 @@ fn render_input(
     };
     let available = width.saturating_sub(prompt.len());
 
-    let text = &app.composer.text;
-    let char_count = text.chars().count();
-    let cursor_char = app.composer.cursor_col();
+    let input_lines: Vec<&str> = app.composer.text.split('\n').collect();
+    let scroll_start;
 
-    let scroll_start = if char_count <= available {
-        0
-    } else {
-        let margin = available / 4;
-        if cursor_char < available.saturating_sub(margin) {
+    // First line uses horizontal scrolling
+    {
+        let first_line = input_lines.first().map(|s| *s).unwrap_or("");
+        let char_count = first_line.chars().count();
+        let cursor_line = app.composer.cursor_line();
+        let cursor_col = if cursor_line == 0 {
+            app.composer.cursor_line_col().1
+        } else {
+            0
+        };
+
+        scroll_start = if char_count <= available {
             0
         } else {
-            cursor_char.saturating_sub(available.saturating_sub(margin))
+            let margin = available / 4;
+            if cursor_col < available.saturating_sub(margin) {
+                0
+            } else {
+                cursor_col.saturating_sub(available.saturating_sub(margin))
+            }
+        };
+    }
+
+    for line_idx in 0..input_h {
+        let r = row + line_idx as u16;
+        queue!(stdout, cursor::MoveTo(x_offset as u16, r))?;
+
+        if line_idx == 0 {
+            // First line with prompt and horizontal scrolling
+            let first_line = input_lines.first().map(|s| *s).unwrap_or("");
+            let display_text: String = first_line.chars().skip(scroll_start).take(available).collect();
+            queue!(
+                stdout,
+                SetForegroundColor(prompt_color),
+                Print(prompt),
+                ResetColor,
+                Print(format!("{:width$}", display_text, width = available)),
+            )?;
+        } else if line_idx < input_lines.len() {
+            // Subsequent lines (continuation)
+            let line = input_lines[line_idx];
+            let display: String = line.chars().take(available).collect();
+            queue!(
+                stdout,
+                SetForegroundColor(prompt_color),
+                Print("  "), // indent to match prompt width
+                ResetColor,
+                Print(format!("{:width$}", display, width = available)),
+            )?;
+        } else {
+            // Empty line (padding)
+            queue!(
+                stdout,
+                Print(format!("{:width$}", "", width = width)),
+            )?;
         }
-    };
-
-    let display_text: String = text.chars().skip(scroll_start).take(available).collect();
-
-    queue!(
-        stdout,
-        SetForegroundColor(prompt_color),
-        Print(prompt),
-        ResetColor,
-        Print(format!("{:width$}", display_text, width = available)),
-    )?;
+    }
 
     Ok(scroll_start)
 }
@@ -986,6 +1273,12 @@ fn render_status_bar(
         .map(|_| " [plan]")
         .unwrap_or("");
 
+    // Scroll lock indicator
+    let scroll_lock_indicator = session
+        .filter(|s| s.scroll_locked)
+        .map(|_| " \u{2191}") // ↑
+        .unwrap_or("");
+
     // Current directory (last component, or ~ abbreviation)
     let cwd_short = session
         .map(|s| {
@@ -1015,15 +1308,39 @@ fn render_status_bar(
     if !plan_indicator.is_empty() {
         left_parts.push(plan_indicator.trim().to_string());
     }
+    if !scroll_lock_indicator.is_empty() {
+        left_parts.push(scroll_lock_indicator.trim().to_string());
+    }
     let left_info = format!("{} ", left_parts.join(" "));
     let left_status = format!("{} ", status);
+
+    // Search indicator
+    let search_indicator = if let Some(ref search) = app.search {
+        if search.matches.is_empty() && search.input.text.is_empty() {
+            "/".to_string()
+        } else if search.matches.is_empty() {
+            format!("/{}", search.input.text)
+        } else {
+            format!("/{} [{}/{}]", search.input.text, search.current_match + 1, search.matches.len())
+        }
+    } else {
+        String::new()
+    };
+
     let right = format!(" {} ", right_parts.join(" \u{2502} ")); // │ separator
+
+    let search_display = if !search_indicator.is_empty() {
+        format!("{} ", search_indicator)
+    } else {
+        String::new()
+    };
+    let search_w = UnicodeWidthStr::width(search_display.as_str());
 
     let left_mode_w = UnicodeWidthStr::width(left_mode.as_str());
     let left_info_w = UnicodeWidthStr::width(left_info.as_str());
     let left_status_w = UnicodeWidthStr::width(left_status.as_str());
     let right_w = UnicodeWidthStr::width(right.as_str());
-    let padding = width.saturating_sub(left_mode_w + left_info_w + left_status_w + right_w);
+    let padding = width.saturating_sub(left_mode_w + left_info_w + left_status_w + search_w + right_w);
 
     let status_color = if is_running {
         Color::Yellow
@@ -1043,6 +1360,8 @@ fn render_status_bar(
         Print(&left_info),
         SetForegroundColor(status_color),
         Print(&left_status),
+        SetForegroundColor(Color::Cyan),
+        Print(&search_display),
         SetForegroundColor(Color::White),
         Print(format!("{:pad$}", "", pad = padding)),
         SetForegroundColor(Color::DarkGrey),

@@ -9,21 +9,22 @@ use crate::app::AppEvent;
 use crate::protocol::types::CliMessage;
 
 pub struct WsServer {
-    port: u16,
+    listener: TcpListener,
     event_tx: mpsc::UnboundedSender<AppEvent>,
 }
 
 impl WsServer {
-    pub fn new(port: u16, event_tx: mpsc::UnboundedSender<AppEvent>) -> Self {
-        Self { port, event_tx }
+    /// Bind the WebSocket server to the given port. Returns an error immediately
+    /// if the port is already in use (e.g. another companion instance).
+    pub async fn bind(port: u16, event_tx: mpsc::UnboundedSender<AppEvent>) -> anyhow::Result<Self> {
+        let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+        tracing::info!("WebSocket server listening on 127.0.0.1:{}", port);
+        Ok(Self { listener, event_tx })
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", self.port)).await?;
-        tracing::info!("WebSocket server listening on 127.0.0.1:{}", self.port);
-
         loop {
-            let (stream, addr) = listener.accept().await?;
+            let (stream, addr) = self.listener.accept().await?;
             tracing::debug!("TCP connection from {}", addr);
             let event_tx = self.event_tx.clone();
             tokio::spawn(async move {

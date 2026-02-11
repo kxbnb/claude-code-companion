@@ -8,9 +8,17 @@ use tokio::sync::mpsc;
 
 use crate::protocol::types::{CliMessage, ContentBlock};
 
+// ─── Search State ───────────────────────────────────────────────────────────
+
+pub struct SearchState {
+    pub input: InputState,
+    pub matches: Vec<usize>,  // line indices into Vec<ChatLine>
+    pub current_match: usize,
+}
+
 // ─── Input State ────────────────────────────────────────────────────────────
 
-/// Simple single-line text input state machine.
+/// Text input state machine with multi-line support.
 pub struct InputState {
     pub text: String,
     pub cursor: usize, // byte offset into text
@@ -111,6 +119,92 @@ impl InputState {
     pub fn cursor_col(&self) -> usize {
         self.text[..self.cursor].chars().count()
     }
+
+    // ─── Multi-line methods ──────────────────────────────────────────────
+
+    /// Insert a newline at the cursor position.
+    pub fn insert_newline(&mut self) {
+        self.text.insert(self.cursor, '\n');
+        self.cursor += 1;
+    }
+
+    /// Number of lines in the text (count of '\n' + 1).
+    pub fn line_count(&self) -> usize {
+        self.text.matches('\n').count() + 1
+    }
+
+    /// Which line the cursor is on (0-indexed).
+    pub fn cursor_line(&self) -> usize {
+        self.text[..self.cursor].matches('\n').count()
+    }
+
+    /// (line, col) of cursor, both 0-indexed (col in chars).
+    pub fn cursor_line_col(&self) -> (usize, usize) {
+        let before = &self.text[..self.cursor];
+        let line = before.matches('\n').count();
+        let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let col = before[line_start..].chars().count();
+        (line, col)
+    }
+
+    /// Move cursor up one line. Returns false if already on first line.
+    pub fn move_up(&mut self) -> bool {
+        let (line, col) = self.cursor_line_col();
+        if line == 0 {
+            return false;
+        }
+        // Find the start of the previous line
+        let before_cursor = &self.text[..self.cursor];
+        let current_line_start = before_cursor.rfind('\n').unwrap(); // guaranteed since line > 0
+        let prev_line_start = self.text[..current_line_start]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let prev_line = &self.text[prev_line_start..current_line_start];
+        let prev_line_chars = prev_line.chars().count();
+        let target_col = col.min(prev_line_chars);
+        // Compute byte offset
+        self.cursor = prev_line_start
+            + prev_line
+                .char_indices()
+                .nth(target_col)
+                .map(|(i, _)| i)
+                .unwrap_or(prev_line.len());
+        true
+    }
+
+    /// Move cursor down one line. Returns false if already on last line.
+    pub fn move_down(&mut self) -> bool {
+        let (line, col) = self.cursor_line_col();
+        if line >= self.line_count() - 1 {
+            return false;
+        }
+        // Find the start of the next line
+        let next_newline = self.text[self.cursor..].find('\n');
+        let current_line_start = self.text[..self.cursor]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        if let Some(nl_offset) = next_newline {
+            let next_line_start = self.cursor + nl_offset + 1;
+            let next_line_end = self.text[next_line_start..]
+                .find('\n')
+                .map(|i| next_line_start + i)
+                .unwrap_or(self.text.len());
+            let next_line = &self.text[next_line_start..next_line_end];
+            let next_line_chars = next_line.chars().count();
+            let target_col = col.min(next_line_chars);
+            self.cursor = next_line_start
+                + next_line
+                    .char_indices()
+                    .nth(target_col)
+                    .map(|(i, _)| i)
+                    .unwrap_or(next_line.len());
+            true
+        } else {
+            false
+        }
+    }
 }
 
 // ─── Mode ───────────────────────────────────────────────────────────────────
@@ -200,6 +294,10 @@ pub enum Command {
     Archive,
     Unarchive { index: Option<usize> },
     Clear,
+    Go { partial_name: String },
+    Export { path: String },
+    Pin,
+    Unpin,
     Help,
     Quit,
     Unknown(String),
@@ -346,6 +444,8 @@ pub struct PersistedSession {
     pub created_at: i64,
     #[serde(default)]
     pub archived: bool,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 // ─── Session ────────────────────────────────────────────────────────────────
@@ -397,6 +497,8 @@ pub struct Session {
     pub created_at: i64,
     /// CLI process join handle (for aborting)
     pub cli_process_handle: Option<tokio::task::JoinHandle<()>>,
+    /// When the CLI process was spawned (for connection timeout detection)
+    pub cli_spawn_time: Option<Instant>,
     /// Whether session needs to be persisted
     pub dirty_persist: bool,
     /// Messages queued to send once CLI connects (for resume / pre-connect)
@@ -433,6 +535,12 @@ pub struct Session {
     pub stream_start: Option<std::time::Instant>,
     /// Output tokens accumulated during current stream
     pub stream_output_tokens: u64,
+    /// Whether scroll is locked (user scrolled up, don't auto-scroll)
+    pub scroll_locked: bool,
+    /// Whether tool results are collapsed
+    pub tool_results_collapsed: bool,
+    /// Whether this session is pinned (sorts to top of sidebar)
+    pub pinned: bool,
 }
 
 impl Session {
@@ -461,6 +569,7 @@ impl Session {
             tasks: Vec::new(),
             created_at: chrono::Utc::now().timestamp(),
             cli_process_handle: None,
+            cli_spawn_time: None,
             dirty_persist: false,
             queued_messages: Vec::new(),
             last_assistant_msg_id: None,
@@ -479,6 +588,9 @@ impl Session {
             pending_question: None,
             stream_start: None,
             stream_output_tokens: 0,
+            scroll_locked: false,
+            tool_results_collapsed: false,
+            pinned: false,
         }
     }
 
@@ -521,6 +633,7 @@ impl Session {
             tasks: self.tasks.clone(),
             created_at: self.created_at,
             archived: self.archived,
+            pinned: self.pinned,
         }
     }
 
@@ -549,6 +662,7 @@ impl Session {
             tasks: p.tasks,
             created_at: p.created_at,
             cli_process_handle: None,
+            cli_spawn_time: None,
             dirty_persist: false,
             queued_messages: Vec::new(),
             last_assistant_msg_id: None,
@@ -562,11 +676,14 @@ impl Session {
             slash_commands: Vec::new(),
             skills: Vec::new(),
             archived: p.archived,
+            pinned: p.pinned,
             previous_permission_mode: None,
             current_tool: None,
             pending_question: None,
             stream_start: None,
             stream_output_tokens: 0,
+            scroll_locked: false,
+            tool_results_collapsed: false,
         }
     }
 
@@ -619,6 +736,20 @@ pub struct App {
     pub show_thinking: bool,
     /// Slash command menu state
     pub slash_menu: SlashMenu,
+    /// Active search state (None when not searching)
+    pub search: Option<SearchState>,
+    /// Input history (sent messages)
+    pub input_history: Vec<String>,
+    /// Current index into input_history (None = not browsing)
+    pub input_history_idx: Option<usize>,
+    /// Draft text saved when entering history browsing
+    pub input_history_draft: String,
+    /// Command history
+    pub command_history: Vec<String>,
+    /// Current index into command_history (None = not browsing)
+    pub command_history_idx: Option<usize>,
+    /// Draft text saved when entering command history browsing
+    pub command_history_draft: String,
 }
 
 impl App {
@@ -643,6 +774,13 @@ impl App {
             tick: 0,
             show_thinking: false,
             slash_menu: SlashMenu::new(),
+            search: None,
+            input_history: Vec::new(),
+            input_history_idx: None,
+            input_history_draft: String::new(),
+            command_history: Vec::new(),
+            command_history_idx: None,
+            command_history_draft: String::new(),
         }
     }
 
@@ -878,9 +1016,9 @@ impl App {
         self.dirty = true;
     }
 
-    /// Get the visible (non-archived) session order
+    /// Get the visible (non-archived) session order, pinned first (stable sort)
     pub fn visible_session_order(&self) -> Vec<String> {
-        self.session_order
+        let mut visible: Vec<String> = self.session_order
             .iter()
             .filter(|id| {
                 !self
@@ -890,7 +1028,14 @@ impl App {
                     .unwrap_or(false)
             })
             .cloned()
-            .collect()
+            .collect();
+        // Stable sort: pinned sessions first
+        visible.sort_by(|a, b| {
+            let a_pinned = self.sessions.get(a.as_str()).map(|s| s.pinned).unwrap_or(false);
+            let b_pinned = self.sessions.get(b.as_str()).map(|s| s.pinned).unwrap_or(false);
+            b_pinned.cmp(&a_pinned)
+        });
+        visible
     }
 
     pub fn get_env_vars(&self, profile_name: &str) -> HashMap<String, String> {

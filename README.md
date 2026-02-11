@@ -47,13 +47,18 @@ The TUI spawns a Claude Code CLI subprocess in SDK mode and communicates over a 
 | `:` | Enter Command mode |
 | `j` / `k` | Scroll down / up |
 | `G` / `gg` | Jump to bottom / top |
+| `Ctrl+D` / `Ctrl+U` | Half-page down / up |
+| `PageUp` / `PageDown` | Scroll by 10 lines |
 | `1`-`9` | Switch to session N |
 | `[` / `]` | Previous / next session |
+| `/` | Search chat (`n`/`N` navigate, `Esc` clear) |
+| `y` | Yank last assistant response to clipboard |
+| `z` | Toggle tool result collapse |
 | `Tab` | Toggle sidebar |
 | `t` | Toggle task panel |
+| `T` | Toggle thinking block visibility |
 | `p` | Toggle plan mode |
 | `Ctrl+N` | New session |
-| `Ctrl+D` / `Ctrl+U` | Half-page down / up |
 | `Ctrl+C` | Interrupt (2x to quit) |
 
 ### Insert mode
@@ -62,9 +67,19 @@ The TUI spawns a Claude Code CLI subprocess in SDK mode and communicates over a 
 |-----|--------|
 | `Enter` | Send message |
 | `Esc` | Back to Normal mode |
+| `Ctrl+J` | Insert newline (multi-line input) |
+| `Up` / `Down` | Navigate lines or cycle input history |
 | `Ctrl+A` / `Ctrl+E` | Home / End |
 | `Ctrl+K` / `Ctrl+U` | Kill to end / start of line |
 | `Ctrl+W` | Delete word backward |
+
+### Command mode
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Execute command |
+| `Esc` | Cancel |
+| `Up` / `Down` | Cycle command history |
 
 ## Commands
 
@@ -75,12 +90,18 @@ The TUI spawns a Claude Code CLI subprocess in SDK mode and communicates over a 
 | `:rename <name>` | Rename session |
 | `:archive` | Archive session |
 | `:unarchive <n>` | Unarchive session by number |
+| `:go <name>` | Fuzzy switch to session by name |
+| `:pin` / `:unpin` | Pin/unpin session to top of sidebar |
 | `:ls` | List all sessions |
 | `:model <name>` | Change model |
 | `:mode <mode>` | Change permission mode |
 | `:cd <path>` | Change working directory |
 | `:wt <branch>` | Open git worktree as new session |
 | `:!<cmd>` | Execute shell command |
+| `:img <path>` | Attach image to send |
+| `:pull` | Git pull in current directory |
+| `:reconnect` | Respawn CLI for current session |
+| `:export <path>` | Export conversation as markdown |
 | `:clear` | Clear chat history |
 | `:help` | Show help |
 | `:quit` | Exit |
@@ -89,11 +110,22 @@ The TUI spawns a Claude Code CLI subprocess in SDK mode and communicates over a 
 
 - **Multiple sessions** with independent chat history, model, and working directory
 - **Session persistence** across restarts (`~/.companion/sessions/`)
+- **Pinned sessions** — pin frequently used sessions to the top of the sidebar
+- **Fuzzy session switch** — `:go` for quick name-based session switching
 - **Git integration** — branch display, ahead/behind tracking, worktree support
 - **Permission management** — approve/deny/always-allow tool use, plan mode toggle
 - **Environment profiles** — preconfigured env vars in `~/.companion/envs/`
 - **Task tracking** — view task progress from Claude's TodoWrite tool
 - **Streaming responses** with animated spinner and tool progress indicators
+- **Markdown rendering** — code blocks, headers, inline code, bold, and bullet lists
+- **Search in chat** — `/` to search, `n`/`N` to navigate matches
+- **Multi-line input** — `Ctrl+J` to insert newlines, input area grows up to 5 lines
+- **Input & command history** — `Up`/`Down` to cycle through previous messages and commands
+- **Clipboard yank** — `y` copies last assistant response to system clipboard
+- **Collapsible tool results** — `z` to toggle tool output visibility
+- **Auto-scroll lock** — scrolling up locks position; `G` unlocks
+- **Export** — `:export` saves conversation as markdown
+- **Desktop notifications** — terminal bell + macOS notification on task completion
 - **Shell execution** — run commands without leaving the TUI
 
 ## Configuration

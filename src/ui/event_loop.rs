@@ -105,6 +105,23 @@ async fn run_inner(
                 if app.sessions.values().any(|s| s.status == SessionStatus::Running || s.status == SessionStatus::Compacting) {
                     app.dirty = true;
                 }
+                // Check for CLI connection timeout (30s without connecting)
+                for session in app.sessions.values_mut() {
+                    if let Some(spawn_time) = session.cli_spawn_time {
+                        if !session.cli_connected && spawn_time.elapsed() > Duration::from_secs(30) {
+                            session.cli_spawn_time = None;
+                            session.status = SessionStatus::WaitingForCli;
+                            session.add_system_message(
+                                "CLI failed to connect (timed out after 30s). Try sending your message again, or use :reconnect".to_string(),
+                            );
+                            // Kill the stuck process
+                            if let Some(handle) = session.cli_process_handle.take() {
+                                handle.abort();
+                            }
+                            app.dirty = true;
+                        }
+                    }
+                }
             }
         }
 
@@ -191,9 +208,10 @@ fn spawn_cli_for_session(
         });
     });
 
-    // Store the handle (mutable borrow)
+    // Store the handle and spawn time (mutable borrow)
     if let Some(session) = app.sessions.get_mut(session_id) {
         session.cli_process_handle = Some(handle);
+        session.cli_spawn_time = Some(std::time::Instant::now());
     }
 }
 
@@ -269,6 +287,10 @@ fn send_user_message(app: &mut App, _event_tx: &mpsc::UnboundedSender<AppEvent>)
 
     let text = app.composer.take();
 
+    // Push to input history
+    app.input_history.push(text.clone());
+    app.input_history_idx = None;
+
     // Check the CLI connection state
     let (cli_connected, has_cli_session, has_sender) = app
         .active_session()
@@ -292,47 +314,65 @@ fn send_user_message(app: &mut App, _event_tx: &mpsc::UnboundedSender<AppEvent>)
             model: None,
             timestamp: chrono::Utc::now().timestamp(),
         });
+        session.scroll_locked = false;
         session.scroll_offset = 0;
     }
 
-    if !has_sender {
-        // CLI is not connected — queue message for delivery after init
-        if let Some(session) = app.active_session_mut() {
-            session.queued_messages.push(text);
-            session.status = SessionStatus::Running; // show "thinking" state
+    if has_sender {
+        // Try to send directly — CLI appears connected
+        let sent = if let Some(session) = app.active_session_mut() {
+            let session_id = session
+                .cli_session_id
+                .clone()
+                .unwrap_or_else(|| session.id.clone());
+            let msg = OutgoingUserMessage::new(text.clone(), session_id.clone());
+            let ndjson = msg.to_ndjson();
+            tracing::info!("Sending to CLI (session_id={}): {}", session_id, &ndjson);
+            let ok = session.send_to_cli(&ndjson);
+            tracing::info!("send_to_cli returned: {}", ok);
+            if ok {
+                session.status = SessionStatus::Running;
+                session.streaming_text.clear();
+                session.scroll_locked = false;
+                session.scroll_offset = 0;
+            }
+            ok
+        } else {
+            false
+        };
+
+        if sent {
+            app.dirty = true;
+            return;
         }
 
-        if !cli_connected && has_cli_session {
-            // Persisted/disconnected session — spawn CLI with --resume
-            if let Some(sid) = app.active_session_id.clone() {
+        // Send failed — channel broken, fall through to queue + respawn
+        tracing::warn!("send_to_cli failed, queueing message for respawn");
+    }
+
+    // CLI is not connected (or send failed) — queue message for delivery after init
+    if let Some(session) = app.active_session_mut() {
+        session.queued_messages.push(text);
+        session.status = SessionStatus::Running; // show "thinking" state
+    }
+
+    if !cli_connected || !has_sender {
+        // Need to spawn/respawn CLI
+        if let Some(sid) = app.active_session_id.clone() {
+            if has_cli_session {
                 if let Some(session) = app.active_session_mut() {
                     session.add_system_message("Resuming session...".to_string());
                 }
+            }
+            // Check if CLI process is already running (pending spawn or starting up)
+            let already_spawning = app.pending_spawns.contains(&sid)
+                || app.sessions.get(&sid).map(|s| s.cli_process_handle.is_some()).unwrap_or(false);
+            if !already_spawning {
                 app.pending_spawns.push(sid);
             }
         }
-        // else: CLI is still starting up, message will be sent when init arrives
-
-        app.dirty = true;
-        return;
     }
 
-    // Normal send — CLI is connected
-    if let Some(session) = app.active_session_mut() {
-        let session_id = session
-            .cli_session_id
-            .clone()
-            .unwrap_or_else(|| session.id.clone());
-        let msg = OutgoingUserMessage::new(text, session_id.clone());
-        let ndjson = msg.to_ndjson();
-        tracing::info!("Sending to CLI (session_id={}): {}", session_id, &ndjson);
-        let sent = session.send_to_cli(&ndjson);
-        tracing::info!("send_to_cli returned: {}", sent);
-
-        session.status = SessionStatus::Running;
-        session.streaming_text.clear();
-        session.scroll_offset = 0;
-    }
     app.dirty = true;
 }
 
@@ -348,6 +388,7 @@ fn handle_app_event(event: AppEvent, app: &mut App) {
             if let Some(session) = app.sessions.get_mut(&session_id) {
                 session.cli_connected = true;
                 session.cli_sender = Some(sender);
+                session.cli_spawn_time = None;
                 session.status = SessionStatus::Idle;
                 app.dirty = true;
             }
@@ -376,7 +417,19 @@ fn handle_app_event(event: AppEvent, app: &mut App) {
             tracing::info!("CLI process exited for session {}", session_id);
             if let Some(session) = app.sessions.get_mut(&session_id) {
                 session.cli_process_handle = None;
-                // CliDisconnected will handle the rest
+                // If CLI never connected (CliDisconnected guard won't fire),
+                // reset state here to avoid being stuck in Running forever.
+                if !session.cli_connected {
+                    let was_running = session.status == SessionStatus::Running;
+                    session.status = SessionStatus::WaitingForCli;
+                    session.cli_sender = None;
+                    if was_running {
+                        session.add_system_message(
+                            "CLI process exited before connecting".to_string(),
+                        );
+                    }
+                    app.dirty = true;
+                }
             }
         }
     }
@@ -452,7 +505,9 @@ fn handle_cli_message(msg: CliMessage, session_id: &str, app: &mut App) {
                         });
                     }
                 }
-                session.scroll_offset = 0;
+                if !session.scroll_locked {
+                    session.scroll_offset = 0;
+                }
             }
         }
         CliMessage::KeepAlive => {}
@@ -529,7 +584,9 @@ fn handle_system_message(msg: types::SystemMessage, session_id: &str, app: &mut 
                     session.send_to_cli(&msg.to_ndjson());
                     session.status = SessionStatus::Running;
                     session.streaming_text.clear();
-                    session.scroll_offset = 0;
+                    if !session.scroll_locked {
+                        session.scroll_offset = 0;
+                    }
                 }
             }
         }
@@ -583,7 +640,9 @@ fn handle_assistant_message(msg: types::AssistantMessage, session_id: &str, app:
     });
 
     session.streaming_text.clear();
-    session.scroll_offset = 0;
+    if !session.scroll_locked {
+        session.scroll_offset = 0;
+    }
     session.status = SessionStatus::Running;
 }
 
@@ -632,6 +691,22 @@ fn handle_result_message(msg: types::ResultMessage, session_id: &str, app: &mut 
     session.current_tool = None;
     session.stream_start = None;
     session.status = SessionStatus::Idle;
+
+    // Desktop notification: bell + macOS notification
+    print!("\x07"); // Terminal bell
+    let session_name = session.name.clone();
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("osascript")
+            .args([
+                "-e",
+                &format!(
+                    "display notification \"Task complete\" with title \"Companion: {}\"",
+                    session_name
+                ),
+            ])
+            .output();
+    });
+
     session.interrupt_sent = false;
     session.dirty_persist = true;
 

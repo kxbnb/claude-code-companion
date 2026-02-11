@@ -730,14 +730,25 @@ fn render_status_bar(
         .map(|s| s.name.as_str())
         .unwrap_or("no session");
 
+    const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let spin = SPINNER[(app.tick as usize) % SPINNER.len()];
+
+    let is_running = session.map(|s| s.status == SessionStatus::Running).unwrap_or(false);
+
     let status = session
         .map(|s| match s.status {
-            SessionStatus::WaitingForCli => "waiting",
-            SessionStatus::Idle => "idle",
-            SessionStatus::Running => "running",
-            SessionStatus::Compacting => "compacting",
+            SessionStatus::WaitingForCli => "waiting".to_string(),
+            SessionStatus::Idle => "idle".to_string(),
+            SessionStatus::Running => {
+                if let Some((ref tool, elapsed)) = s.current_tool {
+                    format!("{} {} {:.0}s", spin, tool, elapsed)
+                } else {
+                    format!("{} thinking", spin)
+                }
+            }
+            SessionStatus::Compacting => format!("{} compacting", spin),
         })
-        .unwrap_or("--");
+        .unwrap_or_else(|| "--".to_string());
 
     let model = session
         .map(|s| {
@@ -814,14 +825,21 @@ fn render_status_bar(
     if !plan_indicator.is_empty() {
         left_parts.push(plan_indicator.trim().to_string());
     }
-    left_parts.push(format!("{} ", status));
-    let left_rest = format!("{} ", left_parts.join(" "));
+    let left_info = format!("{} ", left_parts.join(" "));
+    let left_status = format!("{} ", status);
     let right = format!(" {} ", right_parts.join(" \u{2502} ")); // │ separator
 
     let left_mode_w = UnicodeWidthStr::width(left_mode.as_str());
-    let left_rest_w = UnicodeWidthStr::width(left_rest.as_str());
+    let left_info_w = UnicodeWidthStr::width(left_info.as_str());
+    let left_status_w = UnicodeWidthStr::width(left_status.as_str());
     let right_w = UnicodeWidthStr::width(right.as_str());
-    let padding = width.saturating_sub(left_mode_w + left_rest_w + right_w);
+    let padding = width.saturating_sub(left_mode_w + left_info_w + left_status_w + right_w);
+
+    let status_color = if is_running {
+        Color::Yellow
+    } else {
+        Color::White
+    };
 
     queue!(
         stdout,
@@ -832,10 +850,13 @@ fn render_status_bar(
         SetAttribute(Attribute::Reset),
         SetBackgroundColor(Color::Rgb { r: 30, g: 30, b: 30 }),
         SetForegroundColor(Color::White),
-        Print(&left_rest),
+        Print(&left_info),
+        SetForegroundColor(status_color),
+        Print(&left_status),
+        SetForegroundColor(Color::White),
         Print(format!("{:pad$}", "", pad = padding)),
         SetForegroundColor(Color::DarkGrey),
-        Print(truncate_to_width(&right, right_w.min(width.saturating_sub(left_mode_w + left_rest_w)))),
+        Print(truncate_to_width(&right, right_w.min(width.saturating_sub(left_mode_w + left_info_w + left_status_w)))),
         ResetColor,
     )?;
 

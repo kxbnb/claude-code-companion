@@ -1,7 +1,16 @@
 use crate::app::{App, Command, Mode, SessionStatus};
 
 pub fn parse_command(input: &str) -> Command {
-    let parts: Vec<&str> = input.trim().splitn(2, ' ').collect();
+    let trimmed = input.trim();
+
+    // :!<cmd> shorthand (vim-style)
+    if let Some(rest) = trimmed.strip_prefix('!') {
+        return Command::Exec {
+            cmd: rest.trim().to_string(),
+        };
+    }
+
+    let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
     let cmd = parts[0];
     let arg = parts.get(1).map(|s| s.trim().to_string());
 
@@ -24,6 +33,9 @@ pub fn parse_command(input: &str) -> Command {
         },
         "wt" | "worktree" => Command::Worktree {
             branch: arg.unwrap_or_default(),
+        },
+        "exec" => Command::Exec {
+            cmd: arg.unwrap_or_default(),
         },
         "archive" => Command::Archive,
         "unarchive" => Command::Unarchive {
@@ -200,6 +212,51 @@ pub fn execute_command(cmd: Command, app: &mut App) -> CommandResult {
             app.dirty = true;
             CommandResult::Ok
         }
+        Command::Exec { cmd: shell_cmd } => {
+            if shell_cmd.is_empty() {
+                app.flash("Usage: :exec <command> or :!<command>".to_string());
+                return CommandResult::Ok;
+            }
+            let cwd = app
+                .active_session()
+                .map(|s| s.cwd.clone())
+                .unwrap_or_else(|| app.default_cwd.clone());
+
+            use std::process::Command as ProcessCommand;
+            let result = ProcessCommand::new("sh")
+                .args(["-c", &shell_cmd])
+                .current_dir(&cwd)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output();
+
+            match result {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let mut text = format!("$ {}", shell_cmd);
+                    if !stdout.is_empty() {
+                        text.push('\n');
+                        text.push_str(stdout.trim_end());
+                    }
+                    if !stderr.is_empty() {
+                        text.push('\n');
+                        text.push_str(stderr.trim_end());
+                    }
+                    if !output.status.success() {
+                        text.push_str(&format!("\n[exit {}]", output.status.code().unwrap_or(-1)));
+                    }
+                    if let Some(session) = app.active_session_mut() {
+                        session.add_system_message(text);
+                    }
+                }
+                Err(e) => {
+                    app.flash(format!("exec failed: {}", e));
+                }
+            }
+            app.dirty = true;
+            CommandResult::Ok
+        }
         Command::Worktree { branch } => {
             if branch.is_empty() {
                 app.flash("Usage: :wt <branch>".to_string());
@@ -346,6 +403,7 @@ pub fn execute_command(cmd: Command, app: &mut App) -> CommandResult {
                 "  :rename <name>   Rename current session",
                 "  :cd <path>       Change working directory",
                 "  :wt <branch>     New session in git worktree",
+                "  :!<cmd>          Execute shell command",
                 "  :ls              List all sessions",
                 "  :model <name>    Change model",
                 "  :mode <mode>     Change permission mode",

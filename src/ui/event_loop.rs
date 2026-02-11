@@ -93,12 +93,17 @@ async fn run_inner(
             }
             // Tick timer for periodic redraws
             _ = tick.tick() => {
+                app.tick = app.tick.wrapping_add(1);
                 // Check flash message expiry (3 seconds)
                 if let Some((_, instant)) = &app.flash_message {
                     if instant.elapsed() > Duration::from_secs(3) {
                         app.flash_message = None;
                         app.dirty = true;
                     }
+                }
+                // Force redraw when any session is running (for spinner)
+                if app.active_session().map(|s| s.status == SessionStatus::Running).unwrap_or(false) {
+                    app.dirty = true;
                 }
             }
         }
@@ -375,14 +380,23 @@ fn handle_cli_message(msg: CliMessage, session_id: &str, app: &mut App) {
         CliMessage::StreamEvent(stream) => handle_stream_event(stream, session_id, app),
         CliMessage::ControlRequest(ctrl) => handle_control_request(ctrl, session_id, app),
         CliMessage::ToolProgress(prog) => {
-            tracing::debug!(
-                "Tool progress: {} ({:.1}s)",
-                prog.tool_name,
-                prog.elapsed_time_seconds.unwrap_or(0.0)
-            );
+            if let Some(session) = app.sessions.get_mut(session_id) {
+                session.current_tool = Some((
+                    prog.tool_name.clone(),
+                    prog.elapsed_time_seconds.unwrap_or(0.0),
+                ));
+            }
         }
         CliMessage::ToolUseSummary(summary) => {
-            tracing::debug!("Tool summary: {}", summary.summary);
+            if let Some(session) = app.sessions.get_mut(session_id) {
+                session.messages.push(ChatMessage {
+                    role: ChatRole::System,
+                    content: summary.summary.clone(),
+                    content_blocks: None,
+                    model: None,
+                    timestamp: chrono::Utc::now().timestamp(),
+                });
+            }
         }
         CliMessage::AuthStatus(auth) => {
             if let Some(error) = auth.error {
@@ -562,6 +576,7 @@ fn handle_result_message(msg: types::ResultMessage, session_id: &str, app: &mut 
     }
 
     session.streaming_text.clear();
+    session.current_tool = None;
     session.status = SessionStatus::Idle;
     session.interrupt_sent = false;
     session.dirty_persist = true;

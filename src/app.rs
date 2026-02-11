@@ -193,6 +193,7 @@ pub enum Command {
     PermMode { mode: String },
     Cd { path: String },
     Worktree { branch: String },
+    Exec { cmd: String },
     Archive,
     Unarchive { index: Option<usize> },
     Clear,
@@ -363,6 +364,8 @@ pub struct Session {
     pub archived: bool,
     /// Previous permission mode (for plan mode toggle restore)
     pub previous_permission_mode: Option<String>,
+    /// Current active tool (from ToolProgress, cleared on result)
+    pub current_tool: Option<(String, f64)>,
 }
 
 impl Session {
@@ -405,6 +408,7 @@ impl Session {
             skills: Vec::new(),
             archived: false,
             previous_permission_mode: None,
+            current_tool: None,
         }
     }
 
@@ -489,6 +493,7 @@ impl Session {
             skills: Vec::new(),
             archived: p.archived,
             previous_permission_mode: None,
+            current_tool: None,
         }
     }
 
@@ -535,6 +540,8 @@ pub struct App {
     pub gg_pending: bool,
     /// Session IDs that need a CLI process spawned
     pub pending_spawns: Vec<String>,
+    /// Tick counter for spinner animation
+    pub tick: u64,
 }
 
 impl App {
@@ -556,6 +563,7 @@ impl App {
             flash_message: None,
             gg_pending: false,
             pending_spawns: Vec::new(),
+            tick: 0,
         }
     }
 

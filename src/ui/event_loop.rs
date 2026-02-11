@@ -102,7 +102,7 @@ async fn run_inner(
                     }
                 }
                 // Force redraw when any session is running (for spinner)
-                if app.active_session().map(|s| s.status == SessionStatus::Running).unwrap_or(false) {
+                if app.sessions.values().any(|s| s.status == SessionStatus::Running || s.status == SessionStatus::Compacting) {
                     app.dirty = true;
                 }
             }

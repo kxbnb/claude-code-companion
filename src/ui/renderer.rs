@@ -196,9 +196,11 @@ fn render_sidebar(
         if let Some(session) = app.sessions.get(id.as_str()) {
             let is_active = active_id == Some(id.as_str());
             let marker = if is_active { ">" } else { " " };
+            const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             let status_icon = match session.status {
-                SessionStatus::Running => "\u{25b6}",  // ▶
-                SessionStatus::Compacting => "\u{21bb}", // ↻
+                SessionStatus::Running | SessionStatus::Compacting => {
+                    SPINNER[(app.tick as usize) % SPINNER.len()]
+                }
                 SessionStatus::WaitingForCli => "\u{25cb}", // ○
                 SessionStatus::Idle => {
                     if session.cli_connected {

@@ -1,5 +1,5 @@
 [package]
-name = "companion-tui"
+name = "claude-code-companion"
 version = "0.1.0"
 edition = "2021"
 description = "Terminal companion for Claude Code"

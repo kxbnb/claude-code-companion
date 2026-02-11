@@ -2,6 +2,12 @@
 name = "companion-tui"
 version = "0.1.0"
 edition = "2021"
+description = "Terminal companion for Claude Code"
+license = "MIT"
+repository = "https://github.com/kxbnb/claude-code-companion"
+authors = ["kxbnb"]
+keywords = ["tui", "claude", "terminal", "companion"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

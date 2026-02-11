@@ -24,6 +24,8 @@ pub enum CliMessage {
     ToolUseSummary(ToolUseSummaryMessage),
     #[serde(rename = "auth_status")]
     AuthStatus(AuthStatusMessage),
+    #[serde(rename = "message_history")]
+    MessageHistory(MessageHistoryMessage),
     #[serde(rename = "keep_alive")]
     KeepAlive,
     #[serde(other)]
@@ -272,6 +274,50 @@ impl OutgoingUserMessage {
     }
 }
 
+/// User message with image content sent to the CLI
+#[derive(Debug, Serialize)]
+pub struct OutgoingImageMessage {
+    #[serde(rename = "type")]
+    pub msg_type: &'static str,
+    pub message: OutgoingImageContent,
+    pub session_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OutgoingImageContent {
+    pub role: &'static str,
+    pub content: Vec<serde_json::Value>,
+}
+
+impl OutgoingImageMessage {
+    pub fn new(text: Option<String>, image_b64: String, media_type: String, session_id: String) -> Self {
+        let mut content = Vec::new();
+        if let Some(t) = text {
+            content.push(serde_json::json!({"type": "text", "text": t}));
+        }
+        content.push(serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": image_b64,
+            }
+        }));
+        Self {
+            msg_type: "user",
+            message: OutgoingImageContent {
+                role: "user",
+                content,
+            },
+            session_id,
+        }
+    }
+
+    pub fn to_ndjson(&self) -> String {
+        serde_json::to_string(self).expect("serialization of protocol message cannot fail")
+    }
+}
+
 /// Control response for permission requests
 #[derive(Debug, Serialize)]
 pub struct OutgoingControlResponse {
@@ -344,6 +390,24 @@ impl OutgoingControlRequest {
         serde_json::to_string(self).expect("serialization of protocol message cannot fail")
     }
 }
+
+// ─── Message History ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MessageHistoryMessage {
+    pub messages: Vec<HistoryEntry>,
+    pub uuid: Option<String>,
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HistoryEntry {
+    pub role: Option<String>,
+    pub content: serde_json::Value,
+    pub model: Option<String>,
+}
+
+// ─── Server → CLI Messages (outgoing NDJSON) ────────────────────────────────
 
 /// Set permission mode message sent to the CLI
 #[derive(Debug, Serialize)]

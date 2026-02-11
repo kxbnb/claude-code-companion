@@ -37,6 +37,11 @@ pub fn parse_command(input: &str) -> Command {
         "exec" => Command::Exec {
             cmd: arg.unwrap_or_default(),
         },
+        "img" | "image" => Command::Img {
+            path: arg.unwrap_or_default(),
+        },
+        "pull" => Command::Pull,
+        "reconnect" | "rc" => Command::Reconnect,
         "archive" => Command::Archive,
         "unarchive" => Command::Unarchive {
             index: arg.and_then(|s| s.parse::<usize>().ok()),
@@ -207,6 +212,133 @@ pub fn execute_command(cmd: Command, app: &mut App) -> CommandResult {
                     }
                 } else {
                     app.flash(format!("Not a directory: {}", expanded));
+                }
+            }
+            app.dirty = true;
+            CommandResult::Ok
+        }
+        Command::Img { path } => {
+            if path.is_empty() {
+                app.flash("Usage: :img <path>".to_string());
+                return CommandResult::Ok;
+            }
+            let expanded = if path.starts_with('~') {
+                dirs::home_dir()
+                    .map(|h| path.replacen('~', &h.to_string_lossy(), 1))
+                    .unwrap_or(path.clone())
+            } else if path.starts_with('/') {
+                path.clone()
+            } else {
+                let cwd = app
+                    .active_session()
+                    .map(|s| s.cwd.clone())
+                    .unwrap_or_else(|| app.default_cwd.clone());
+                format!("{}/{}", cwd, path)
+            };
+
+            let file_path = std::path::Path::new(&expanded);
+            if !file_path.exists() {
+                app.flash(format!("File not found: {}", expanded));
+                return CommandResult::Ok;
+            }
+
+            // Determine media type from extension
+            let media_type = match file_path.extension().and_then(|e| e.to_str()) {
+                Some("png") => "image/png",
+                Some("jpg") | Some("jpeg") => "image/jpeg",
+                Some("gif") => "image/gif",
+                Some("webp") => "image/webp",
+                _ => {
+                    app.flash("Unsupported image format (use png/jpg/gif/webp)".to_string());
+                    return CommandResult::Ok;
+                }
+            };
+
+            // Read and base64 encode
+            match std::fs::read(&expanded) {
+                Ok(bytes) => {
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    if let Some(session) = app.active_session_mut() {
+                        let session_id = session
+                            .cli_session_id
+                            .clone()
+                            .unwrap_or_else(|| session.id.clone());
+                        let msg = crate::protocol::types::OutgoingImageMessage::new(
+                            None,
+                            b64,
+                            media_type.to_string(),
+                            session_id,
+                        );
+                        session.send_to_cli(&msg.to_ndjson());
+                        session.add_system_message(format!("[attached image: {}]", path));
+                        session.status = crate::app::SessionStatus::Running;
+                    }
+                }
+                Err(e) => {
+                    app.flash(format!("Failed to read image: {}", e));
+                }
+            }
+            app.dirty = true;
+            CommandResult::Ok
+        }
+        Command::Reconnect => {
+            if let Some(id) = app.active_session_id.clone() {
+                if let Some(session) = app.sessions.get_mut(&id) {
+                    // Kill existing process handle if any
+                    if let Some(handle) = session.cli_process_handle.take() {
+                        handle.abort();
+                    }
+                    session.cli_connected = false;
+                    session.cli_sender = None;
+                    session.status = SessionStatus::WaitingForCli;
+                    session.add_system_message("Reconnecting...".to_string());
+                }
+                app.pending_spawns.push(id);
+            }
+            app.dirty = true;
+            CommandResult::Ok
+        }
+        Command::Pull => {
+            let cwd = app
+                .active_session()
+                .map(|s| s.cwd.clone())
+                .unwrap_or_else(|| app.default_cwd.clone());
+
+            use std::process::Command as ProcessCommand;
+            let result = ProcessCommand::new("git")
+                .args(["pull"])
+                .current_dir(&cwd)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output();
+
+            match result {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let mut text = String::from("$ git pull");
+                    if !stdout.is_empty() {
+                        text.push('\n');
+                        text.push_str(stdout.trim_end());
+                    }
+                    if !stderr.is_empty() {
+                        text.push('\n');
+                        text.push_str(stderr.trim_end());
+                    }
+                    if let Some(session) = app.active_session_mut() {
+                        session.add_system_message(text);
+                        // Refresh git info
+                        let git = crate::app::gather_git_info(&cwd);
+                        session.git_branch = git.branch;
+                        session.is_worktree = git.is_worktree;
+                        session.repo_root = git.repo_root;
+                        session.git_ahead = git.ahead;
+                        session.git_behind = git.behind;
+                    }
+                }
+                Err(e) => {
+                    app.flash(format!("git pull failed: {}", e));
                 }
             }
             app.dirty = true;
@@ -404,6 +536,9 @@ pub fn execute_command(cmd: Command, app: &mut App) -> CommandResult {
                 "  :cd <path>       Change working directory",
                 "  :wt <branch>     New session in git worktree",
                 "  :!<cmd>          Execute shell command",
+                "  :img <path>      Attach image to send",
+                "  :pull             Git pull in current dir",
+                "  :reconnect/:rc    Respawn CLI for session",
                 "  :ls              List all sessions",
                 "  :model <name>    Change model",
                 "  :mode <mode>     Change permission mode",

@@ -194,6 +194,9 @@ pub enum Command {
     Cd { path: String },
     Worktree { branch: String },
     Exec { cmd: String },
+    Img { path: String },
+    Pull,
+    Reconnect,
     Archive,
     Unarchive { index: Option<usize> },
     Clear,
@@ -262,6 +265,64 @@ pub struct PendingPermission {
     pub tool_name: String,
     pub input: serde_json::Value,
     pub description: Option<String>,
+    pub permission_suggestions: Option<Vec<serde_json::Value>>,
+}
+
+// ─── Pending Question (AskUserQuestion) ─────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct PendingQuestion {
+    pub tool_use_id: String,
+    pub questions: Vec<QuestionItem>,
+    pub selected: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuestionItem {
+    pub question: String,
+    pub options: Vec<QuestionOption>,
+    pub selected_option: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: String,
+}
+
+// ─── Slash Command Menu ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct SlashMenu {
+    pub visible: bool,
+    pub filter: String,
+    pub items: Vec<SlashMenuItem>,
+    pub selected: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SlashMenuItem {
+    pub name: String,
+    pub is_skill: bool,
+}
+
+impl SlashMenu {
+    pub fn new() -> Self {
+        Self {
+            visible: false,
+            filter: String::new(),
+            items: Vec::new(),
+            selected: 0,
+        }
+    }
+
+    pub fn filtered_items(&self) -> Vec<&SlashMenuItem> {
+        let f = self.filter.to_lowercase();
+        self.items
+            .iter()
+            .filter(|item| f.is_empty() || item.name.to_lowercase().contains(&f))
+            .collect()
+    }
 }
 
 // ─── Persisted Session ──────────────────────────────────────────────────────
@@ -366,6 +427,12 @@ pub struct Session {
     pub previous_permission_mode: Option<String>,
     /// Current active tool (from ToolProgress, cleared on result)
     pub current_tool: Option<(String, f64)>,
+    /// Pending AskUserQuestion
+    pub pending_question: Option<PendingQuestion>,
+    /// Streaming start time (for elapsed calculation)
+    pub stream_start: Option<std::time::Instant>,
+    /// Output tokens accumulated during current stream
+    pub stream_output_tokens: u64,
 }
 
 impl Session {
@@ -409,6 +476,9 @@ impl Session {
             archived: false,
             previous_permission_mode: None,
             current_tool: None,
+            pending_question: None,
+            stream_start: None,
+            stream_output_tokens: 0,
         }
     }
 
@@ -494,6 +564,9 @@ impl Session {
             archived: p.archived,
             previous_permission_mode: None,
             current_tool: None,
+            pending_question: None,
+            stream_start: None,
+            stream_output_tokens: 0,
         }
     }
 
@@ -542,6 +615,10 @@ pub struct App {
     pub pending_spawns: Vec<String>,
     /// Tick counter for spinner animation
     pub tick: u64,
+    /// Whether to show thinking blocks in chat
+    pub show_thinking: bool,
+    /// Slash command menu state
+    pub slash_menu: SlashMenu,
 }
 
 impl App {
@@ -564,6 +641,8 @@ impl App {
             gg_pending: false,
             pending_spawns: Vec::new(),
             tick: 0,
+            show_thinking: false,
+            slash_menu: SlashMenu::new(),
         }
     }
 

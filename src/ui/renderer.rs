@@ -84,7 +84,7 @@ pub fn render(app: &App, stdout: &mut impl Write) -> anyhow::Result<()> {
     // Chat area
     let session = app.active_session();
     let chat_lines = if let Some(session) = session {
-        build_chat_lines(session, content_w)
+        build_chat_lines(session, content_w, app.show_thinking)
     } else {
         vec![StyledLine {
             text: "No active session. Press Ctrl+N to create one.".to_string(),
@@ -98,7 +98,15 @@ pub fn render(app: &App, stdout: &mut impl Write) -> anyhow::Result<()> {
     } else {
         0
     };
-    let effective_chat_h = chat_height.saturating_sub(perm_lines);
+    let question_lines = if let Some(session) = session {
+        session.pending_question.as_ref().map(|q| {
+            if q.questions.is_empty() { 0 }
+            else { q.questions[q.selected].options.len() + 2 }
+        }).unwrap_or(0)
+    } else {
+        0
+    };
+    let effective_chat_h = chat_height.saturating_sub(perm_lines + question_lines);
 
     let scroll_offset = session.map(|s| s.scroll_offset).unwrap_or(0);
     render_chat_area(
@@ -118,6 +126,14 @@ pub fn render(app: &App, stdout: &mut impl Write) -> anyhow::Result<()> {
         }
     }
 
+    // Question overlay
+    if question_lines > 0 {
+        if let Some(session) = session {
+            let question_row = (effective_chat_h + perm_lines) as u16;
+            render_question_overlay(stdout, session, question_row, content_w, content_x)?;
+        }
+    }
+
     // Task panel
     if task_h > 0 {
         let task_row = chat_height as u16;
@@ -127,6 +143,11 @@ pub fn render(app: &App, stdout: &mut impl Write) -> anyhow::Result<()> {
     // Input line
     let input_row = (chat_height + task_h) as u16;
     let input_scroll_start = render_input(stdout, app, input_row, content_w, content_x)?;
+
+    // Slash command menu (above input line)
+    if app.slash_menu.visible {
+        render_slash_menu(stdout, app, input_row.saturating_sub(1), content_w, content_x)?;
+    }
 
     // Status bar (full width, last row)
     let status_row = (height - 1) as u16;
@@ -317,7 +338,7 @@ fn render_sidebar(
 
 // ─── Chat Lines ─────────────────────────────────────────────────────────────
 
-fn build_chat_lines(session: &Session, width: usize) -> Vec<StyledLine> {
+fn build_chat_lines(session: &Session, width: usize, show_thinking: bool) -> Vec<StyledLine> {
     let mut lines = Vec::new();
 
     for msg in &session.messages {
@@ -337,17 +358,37 @@ fn build_chat_lines(session: &Session, width: usize) -> Vec<StyledLine> {
             }
             ChatRole::Assistant => {
                 if let Some(blocks) = &msg.content_blocks {
-                    for block in blocks {
-                        match block {
+                    // Group consecutive tool_use blocks by name
+                    let mut i = 0;
+                    while i < blocks.len() {
+                        match &blocks[i] {
                             ContentBlock::ToolUse { name, input, .. } => {
-                                let summary = types::format_tool_summary(name, input);
-                                let text = format!("[{}] {}", name, summary);
+                                // Count consecutive tool uses with same name
+                                let mut count = 1;
+                                let first_summary = types::format_tool_summary(name, input);
+                                while i + count < blocks.len() {
+                                    if let ContentBlock::ToolUse { name: next_name, .. } = &blocks[i + count] {
+                                        if next_name == name {
+                                            count += 1;
+                                        } else {
+                                            break;
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                let text = if count > 1 {
+                                    format!("[{} x{}] {}", name, count, first_summary)
+                                } else {
+                                    format!("[{}] {}", name, first_summary)
+                                };
                                 for line in wrap_text(&text, width) {
                                     lines.push(StyledLine {
                                         text: line,
                                         style: LineStyle::Tool,
                                     });
                                 }
+                                i += count;
                             }
                             ContentBlock::ToolResult {
                                 content, is_error, ..
@@ -366,9 +407,10 @@ fn build_chat_lines(session: &Session, width: usize) -> Vec<StyledLine> {
                                         });
                                     }
                                 }
+                                i += 1;
                             }
                             ContentBlock::Thinking { thinking, .. } => {
-                                if !thinking.is_empty() {
+                                if show_thinking && !thinking.is_empty() {
                                     let truncated = truncate_chars(thinking, 200);
                                     let text = format!("(thinking) {}", truncated);
                                     for line in wrap_text(&text, width) {
@@ -378,8 +420,11 @@ fn build_chat_lines(session: &Session, width: usize) -> Vec<StyledLine> {
                                         });
                                     }
                                 }
+                                i += 1;
                             }
-                            _ => {}
+                            _ => {
+                                i += 1;
+                            }
                         }
                     }
                 }
@@ -420,6 +465,16 @@ fn build_chat_lines(session: &Session, width: usize) -> Vec<StyledLine> {
             lines.push(StyledLine {
                 text: line,
                 style: LineStyle::Streaming,
+            });
+        }
+        // Show streaming stats
+        if let Some(start) = session.stream_start {
+            let elapsed = start.elapsed().as_secs_f64();
+            let toks = session.stream_output_tokens;
+            let tps = if elapsed > 0.0 { toks as f64 / elapsed } else { 0.0 };
+            lines.push(StyledLine {
+                text: format!("{:.1}s \u{2502} ~{} tokens \u{2502} {:.0} tok/s", elapsed, toks, tps),
+                style: LineStyle::Dim,
             });
         }
     }
@@ -536,8 +591,18 @@ fn render_chat_area(
 // ─── Permission Banner ──────────────────────────────────────────────────────
 
 fn build_permission_banner(session: &Session, _width: usize) -> usize {
-    if session.pending_permission.is_some() {
-        3 // tool name + description + key hints
+    if let Some(perm) = &session.pending_permission {
+        let mut count = 2; // header + key hints
+        if perm.tool_name == "Edit" {
+            if perm.input.get("file_path").is_some() { count += 1; }
+            if perm.input.get("old_string").is_some() { count += 1; }
+            if perm.input.get("new_string").is_some() { count += 1; }
+        } else if perm.tool_name == "Write" || perm.tool_name == "Bash" {
+            count += 1;
+        } else {
+            count += 1;
+        }
+        count
     } else {
         0
     }
@@ -551,16 +616,40 @@ fn render_permission_banner(
     x_offset: usize,
 ) -> anyhow::Result<()> {
     if let Some(perm) = &session.pending_permission {
-        let desc = perm
-            .description
-            .as_deref()
-            .unwrap_or(&perm.tool_name);
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(format!("\u{2502} Permission: {}", perm.tool_name));
 
-        let lines = [
-            format!("\u{2502} Permission: {}", perm.tool_name),
-            format!("\u{2502} {}", truncate_chars(desc, width.saturating_sub(4))),
-            "\u{2502} [Y]es  [N]o  [A]lways allow".to_string(),
-        ];
+        // Show edit diff for Edit tool
+        if perm.tool_name == "Edit" {
+            if let Some(file_path) = perm.input.get("file_path").and_then(|v| v.as_str()) {
+                lines.push(format!("\u{2502} File: {}", file_path));
+            }
+            if let Some(old) = perm.input.get("old_string").and_then(|v| v.as_str()) {
+                let preview = truncate_chars(old, width.saturating_sub(6));
+                lines.push(format!("\u{2502} - {}", preview));
+            }
+            if let Some(new) = perm.input.get("new_string").and_then(|v| v.as_str()) {
+                let preview = truncate_chars(new, width.saturating_sub(6));
+                lines.push(format!("\u{2502} + {}", preview));
+            }
+        } else if perm.tool_name == "Write" {
+            if let Some(file_path) = perm.input.get("file_path").and_then(|v| v.as_str()) {
+                lines.push(format!("\u{2502} File: {}", file_path));
+            }
+        } else if perm.tool_name == "Bash" {
+            if let Some(cmd) = perm.input.get("command").and_then(|v| v.as_str()) {
+                let preview = truncate_chars(cmd, width.saturating_sub(4));
+                lines.push(format!("\u{2502} {}", preview));
+            }
+        } else {
+            let desc = perm
+                .description
+                .as_deref()
+                .unwrap_or(&perm.tool_name);
+            lines.push(format!("\u{2502} {}", truncate_chars(desc, width.saturating_sub(4))));
+        }
+
+        lines.push("\u{2502} [Y]es  [N]o  [A]lways allow".to_string());
 
         for (i, line) in lines.iter().enumerate() {
             let row = start_row + i as u16;
@@ -570,6 +659,101 @@ fn render_permission_banner(
                 cursor::MoveTo(x_offset as u16, row),
                 SetBackgroundColor(Color::DarkYellow),
                 SetForegroundColor(Color::Black),
+                Print(format!("{:width$}", display, width = width)),
+                ResetColor,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+// ─── Slash Command Menu ──────────────────────────────────────────────────────
+
+fn render_slash_menu(
+    stdout: &mut impl Write,
+    app: &App,
+    menu_row: u16,
+    width: usize,
+    x_offset: usize,
+) -> anyhow::Result<()> {
+    if !app.slash_menu.visible {
+        return Ok(());
+    }
+
+    let items = app.slash_menu.filtered_items();
+    let max_visible = 8.min(items.len());
+    if max_visible == 0 {
+        return Ok(());
+    }
+
+    // Render upward from the menu_row
+    for i in 0..max_visible {
+        let row = menu_row.saturating_sub((max_visible - i) as u16);
+        let item = &items[i];
+        let is_selected = i == app.slash_menu.selected;
+
+        let prefix = if item.is_skill { "\u{2726} " } else { "/ " };
+        let label = format!("{}{}", prefix, item.name);
+        let display = truncate_to_width(&label, width.saturating_sub(2));
+
+        queue!(stdout, cursor::MoveTo(x_offset as u16, row))?;
+
+        if is_selected {
+            queue!(
+                stdout,
+                SetBackgroundColor(Color::Rgb { r: 60, g: 60, b: 100 }),
+                SetForegroundColor(Color::White),
+                SetAttribute(Attribute::Bold),
+            )?;
+        } else {
+            queue!(
+                stdout,
+                SetBackgroundColor(Color::Rgb { r: 40, g: 40, b: 40 }),
+                SetForegroundColor(Color::Grey),
+            )?;
+        }
+
+        queue!(
+            stdout,
+            Print(format!(" {:w$}", display, w = width.saturating_sub(1))),
+            ResetColor,
+            SetAttribute(Attribute::Reset),
+        )?;
+    }
+
+    Ok(())
+}
+
+// ─── Question Overlay ────────────────────────────────────────────────────────
+
+fn render_question_overlay(
+    stdout: &mut impl Write,
+    session: &Session,
+    start_row: u16,
+    width: usize,
+    x_offset: usize,
+) -> anyhow::Result<()> {
+    if let Some(q) = &session.pending_question {
+        if q.questions.is_empty() {
+            return Ok(());
+        }
+        let question = &q.questions[q.selected];
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(format!("\u{2502} {}", truncate_to_width(&question.question, width.saturating_sub(4))));
+        for (i, opt) in question.options.iter().enumerate() {
+            let marker = if question.selected_option == Some(i) { ">" } else { " " };
+            lines.push(format!("\u{2502} {} {}. {} - {}", marker, i + 1, opt.label, truncate_to_width(&opt.description, width.saturating_sub(10))));
+        }
+        lines.push("\u{2502} Press 1-9 to select, Enter to confirm, Esc to dismiss".to_string());
+
+        for (i, line) in lines.iter().enumerate() {
+            let row = start_row + i as u16;
+            let display = truncate_to_width(line, width);
+            queue!(
+                stdout,
+                cursor::MoveTo(x_offset as u16, row),
+                SetBackgroundColor(Color::Rgb { r: 30, g: 50, b: 80 }),
+                SetForegroundColor(Color::White),
                 Print(format!("{:width$}", display, width = width)),
                 ResetColor,
             )?;
@@ -775,7 +959,11 @@ fn render_status_bar(
     let mut right_parts: Vec<String> = Vec::new();
     right_parts.push(model);
     if let Some(s) = session {
-        right_parts.push(format!("{}%", s.context_used_percent));
+        let ctx = s.context_used_percent;
+        let bar_len = 5;
+        let filled = ((ctx as usize) * bar_len / 100).min(bar_len);
+        let bar: String = "\u{2588}".repeat(filled) + &"\u{2591}".repeat(bar_len - filled);
+        right_parts.push(format!("{}% {}", ctx, bar));
     }
     right_parts.push(format!("{}/{}", session_idx, session_count));
 

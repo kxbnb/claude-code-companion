@@ -42,6 +42,100 @@ pub fn handle_permission_keys(key: KeyEvent, app: &mut App) -> bool {
     false
 }
 
+/// Handle AskUserQuestion overlay keys. Returns true if a question key was handled.
+pub fn handle_question_keys(key: KeyEvent, app: &mut App) -> bool {
+    let session = match app.active_session_mut() {
+        Some(s) => s,
+        None => return false,
+    };
+
+    if let Some(mut question) = session.pending_question.take() {
+        let q = &mut question.questions[question.selected];
+        let num_options = q.options.len();
+
+        match key.code {
+            // Number keys select option directly (1-9)
+            KeyCode::Char(c @ '1'..='9') => {
+                let idx = (c as usize) - ('1' as usize);
+                if idx < num_options {
+                    q.selected_option = Some(idx);
+                    // Send the response
+                    let selected = &q.options[idx];
+                    let response_text = selected.label.clone();
+                    let tool_use_id = question.tool_use_id.clone();
+
+                    // Send as a tool_result via control response
+                    let resp_json = serde_json::json!({
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "success",
+                            "request_id": tool_use_id,
+                            "response": {
+                                "result": response_text,
+                            }
+                        }
+                    });
+                    session.send_to_cli(&serde_json::to_string(&resp_json).unwrap());
+                    session.add_system_message(format!("[answered] {}", response_text));
+                    app.dirty = true;
+                    return true;
+                }
+                session.pending_question = Some(question);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                q.selected_option = Some(
+                    q.selected_option
+                        .unwrap_or(0)
+                        .saturating_sub(1),
+                );
+                session.pending_question = Some(question);
+                app.dirty = true;
+                return true;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let current = q.selected_option.unwrap_or(0);
+                q.selected_option = Some((current + 1).min(num_options.saturating_sub(1)));
+                session.pending_question = Some(question);
+                app.dirty = true;
+                return true;
+            }
+            KeyCode::Enter => {
+                if let Some(idx) = q.selected_option {
+                    let selected = &q.options[idx];
+                    let response_text = selected.label.clone();
+                    let tool_use_id = question.tool_use_id.clone();
+
+                    let resp_json = serde_json::json!({
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "success",
+                            "request_id": tool_use_id,
+                            "response": {
+                                "result": response_text,
+                            }
+                        }
+                    });
+                    session.send_to_cli(&serde_json::to_string(&resp_json).unwrap());
+                    session.add_system_message(format!("[answered] {}", response_text));
+                    app.dirty = true;
+                    return true;
+                }
+                session.pending_question = Some(question);
+            }
+            KeyCode::Esc => {
+                // Dismiss question
+                session.add_system_message("[question dismissed]".to_string());
+                app.dirty = true;
+                return true;
+            }
+            _ => {
+                session.pending_question = Some(question);
+            }
+        }
+    }
+    false
+}
+
 /// Handle key events in Normal mode. Returns true if a user message should be sent.
 pub fn handle_key_normal(key: KeyEvent, app: &mut App) -> bool {
     // Handle 'gg' for scroll to top
@@ -174,6 +268,12 @@ pub fn handle_key_normal(key: KeyEvent, app: &mut App) -> bool {
             app.layout.task_panel_visible = !app.layout.task_panel_visible;
             app.dirty = true;
         }
+        // Toggle thinking block visibility
+        KeyCode::Char('T') => {
+            app.show_thinking = !app.show_thinking;
+            app.flash(if app.show_thinking { "Thinking: shown".to_string() } else { "Thinking: hidden".to_string() });
+            app.dirty = true;
+        }
         // Toggle plan mode
         KeyCode::Char('p') => {
             if let Some(session) = app.active_session_mut() {
@@ -256,6 +356,70 @@ pub fn handle_key_insert(key: KeyEvent, app: &mut App) -> bool {
         }
     }
 
+    // Slash command menu handling
+    if app.slash_menu.visible {
+        match key.code {
+            KeyCode::Esc => {
+                app.slash_menu.visible = false;
+                app.dirty = true;
+                return false;
+            }
+            KeyCode::Up => {
+                if app.slash_menu.selected > 0 {
+                    app.slash_menu.selected -= 1;
+                }
+                app.dirty = true;
+                return false;
+            }
+            KeyCode::Down => {
+                let count = app.slash_menu.filtered_items().len();
+                if app.slash_menu.selected + 1 < count {
+                    app.slash_menu.selected += 1;
+                }
+                app.dirty = true;
+                return false;
+            }
+            KeyCode::Tab | KeyCode::Enter => {
+                let filtered = app.slash_menu.filtered_items();
+                if let Some(item) = filtered.get(app.slash_menu.selected) {
+                    let name = item.name.clone();
+                    // Replace the /filter text with the selected command
+                    app.composer.text = format!("/{}", name);
+                    app.composer.cursor = app.composer.text.len();
+                }
+                app.slash_menu.visible = false;
+                app.dirty = true;
+                // If Enter, also send the message
+                if key.code == KeyCode::Enter {
+                    return !app.composer.is_empty();
+                }
+                return false;
+            }
+            KeyCode::Backspace => {
+                app.composer.backspace();
+                // Update filter from composer text
+                if app.composer.text.starts_with('/') {
+                    app.slash_menu.filter = app.composer.text[1..].to_string();
+                    app.slash_menu.selected = 0;
+                } else {
+                    app.slash_menu.visible = false;
+                }
+                app.dirty = true;
+                return false;
+            }
+            KeyCode::Char(c) => {
+                app.composer.insert_char(c);
+                if app.composer.text.starts_with('/') {
+                    app.slash_menu.filter = app.composer.text[1..].to_string();
+                    app.slash_menu.selected = 0;
+                }
+                app.dirty = true;
+                return false;
+            }
+            _ => {}
+        }
+    }
+
     match key.code {
         KeyCode::Esc => {
             app.mode = Mode::Normal;
@@ -278,6 +442,32 @@ pub fn handle_key_insert(key: KeyEvent, app: &mut App) -> bool {
                 }
             } else {
                 app.composer.insert_char(c);
+                // Activate slash menu when / is typed as first char
+                if c == '/' && app.composer.text == "/" {
+                    if let Some(session) = app.active_session() {
+                        if !session.slash_commands.is_empty() || !session.skills.is_empty() {
+                            let mut items: Vec<crate::app::SlashMenuItem> = Vec::new();
+                            for cmd in &session.slash_commands {
+                                items.push(crate::app::SlashMenuItem {
+                                    name: cmd.clone(),
+                                    is_skill: false,
+                                });
+                            }
+                            for skill in &session.skills {
+                                items.push(crate::app::SlashMenuItem {
+                                    name: skill.clone(),
+                                    is_skill: true,
+                                });
+                            }
+                            app.slash_menu = crate::app::SlashMenu {
+                                visible: true,
+                                filter: String::new(),
+                                items,
+                                selected: 0,
+                            };
+                        }
+                    }
+                }
             }
             app.dirty = true;
         }

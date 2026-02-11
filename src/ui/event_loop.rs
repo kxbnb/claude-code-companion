@@ -229,6 +229,17 @@ fn handle_key_event(
         }
     }
 
+    // Question overlay intercepts all keys when pending
+    if app
+        .active_session()
+        .map(|s| s.pending_question.is_some())
+        .unwrap_or(false)
+    {
+        if keybindings::handle_question_keys(key, app) {
+            return;
+        }
+    }
+
     match app.mode {
         Mode::Normal => {
             keybindings::handle_key_normal(key, app);
@@ -405,6 +416,45 @@ fn handle_cli_message(msg: CliMessage, session_id: &str, app: &mut App) {
                 }
             }
         }
+        CliMessage::MessageHistory(history) => {
+            if let Some(session) = app.sessions.get_mut(session_id) {
+                for entry in &history.messages {
+                    let role_str = entry.role.as_deref().unwrap_or("assistant");
+                    let role = match role_str {
+                        "user" => crate::app::ChatRole::User,
+                        "assistant" => crate::app::ChatRole::Assistant,
+                        _ => crate::app::ChatRole::System,
+                    };
+                    // Extract text from content (can be string or array of blocks)
+                    let text = if let Some(s) = entry.content.as_str() {
+                        s.to_string()
+                    } else if let Some(arr) = entry.content.as_array() {
+                        arr.iter()
+                            .filter_map(|b| {
+                                if b.get("type")?.as_str()? == "text" {
+                                    b.get("text")?.as_str().map(String::from)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    } else {
+                        String::new()
+                    };
+                    if !text.is_empty() {
+                        session.messages.push(crate::app::ChatMessage {
+                            role,
+                            content: text,
+                            content_blocks: None,
+                            model: entry.model.clone(),
+                            timestamp: chrono::Utc::now().timestamp(),
+                        });
+                    }
+                }
+                session.scroll_offset = 0;
+            }
+        }
         CliMessage::KeepAlive => {}
         CliMessage::Unknown => {
             tracing::debug!("Unknown CLI message type");
@@ -519,6 +569,9 @@ fn handle_assistant_message(msg: types::AssistantMessage, session_id: &str, app:
     // Extract tasks from tool_use blocks
     extract_tasks_from_blocks(&msg.message.content, session);
 
+    // Extract AskUserQuestion if present
+    extract_question_from_blocks(&msg.message.content, session);
+
     let text = types::extract_text_from_blocks(&msg.message.content);
 
     session.messages.push(ChatMessage {
@@ -577,6 +630,7 @@ fn handle_result_message(msg: types::ResultMessage, session_id: &str, app: &mut 
 
     session.streaming_text.clear();
     session.current_tool = None;
+    session.stream_start = None;
     session.status = SessionStatus::Idle;
     session.interrupt_sent = false;
     session.dirty_persist = true;
@@ -595,6 +649,8 @@ fn handle_stream_event(msg: types::StreamEventMessage, session_id: &str, app: &m
 
     if event.get("type").and_then(|v| v.as_str()) == Some("message_start") {
         session.status = SessionStatus::Running;
+        session.stream_start = Some(std::time::Instant::now());
+        session.stream_output_tokens = 0;
         return;
     }
 
@@ -603,6 +659,8 @@ fn handle_stream_event(msg: types::StreamEventMessage, session_id: &str, app: &m
             if delta.get("type").and_then(|v| v.as_str()) == Some("text_delta") {
                 if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
                     session.streaming_text.push_str(text);
+                    // Approximate token count (rough: ~4 chars per token)
+                    session.stream_output_tokens += (text.len() as u64 + 3) / 4;
                     app.dirty = true;
                 }
             }
@@ -625,6 +683,7 @@ fn handle_control_request(
             tool_name,
             input,
             description,
+            permission_suggestions,
             ..
         } => {
             tracing::info!("Permission request: {} - {:?}", tool_name, description);
@@ -637,6 +696,7 @@ fn handle_control_request(
                 tool_name: tool_name.clone(),
                 input: input.clone(),
                 description: Some(format!("{} {}", tool_name, summary)),
+                permission_suggestions: permission_suggestions.clone(),
             });
             app.dirty = true;
         }
@@ -748,6 +808,64 @@ fn extract_tasks_from_blocks(
                     }
                 }
                 _ => {}
+            }
+        }
+    }
+}
+
+fn extract_question_from_blocks(
+    blocks: &[types::ContentBlock],
+    session: &mut crate::app::Session,
+) {
+    use types::ContentBlock;
+
+    for block in blocks {
+        if let ContentBlock::ToolUse { name, input, id } = block {
+            if name == "AskUserQuestion" {
+                if let Some(questions_arr) = input.get("questions").and_then(|v| v.as_array()) {
+                    let mut questions = Vec::new();
+                    for q in questions_arr {
+                        let question_text = q
+                            .get("question")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let mut options = Vec::new();
+                        if let Some(opts) = q.get("options").and_then(|v| v.as_array()) {
+                            for opt in opts {
+                                options.push(crate::app::QuestionOption {
+                                    label: opt
+                                        .get("label")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    description: opt
+                                        .get("description")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                });
+                            }
+                        }
+                        // Add "Other..." option
+                        options.push(crate::app::QuestionOption {
+                            label: "Other...".to_string(),
+                            description: "Type a custom response".to_string(),
+                        });
+                        questions.push(crate::app::QuestionItem {
+                            question: question_text,
+                            options,
+                            selected_option: None,
+                        });
+                    }
+                    if !questions.is_empty() {
+                        session.pending_question = Some(crate::app::PendingQuestion {
+                            tool_use_id: id.clone(),
+                            questions,
+                            selected: 0,
+                        });
+                    }
+                }
             }
         }
     }
